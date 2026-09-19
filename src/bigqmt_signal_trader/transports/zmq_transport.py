@@ -423,11 +423,22 @@ class ZmqTransport(RpcTransport):
             # 只在真正停机时关。重连路径上 _bind_configured_address 会建一个新的，
             # 这里再关就把新 socket 关掉了 —— 那会让「重连成功」变成静默失效。
             if not self._running:
-                try:
-                    self._router.close(linger=0)
-                except Exception:
-                    pass
+                if self._router is not None:
+                    try:
+                        self._router.close(linger=0)
+                    except Exception:
+                        pass
                 self._router = None
+                # The PULL half is consumed by this router thread. Leaving it
+                # open made each stopped background server leak a socket until
+                # garbage collection (and pyzmq 27 reports that as a warning).
+                wake_recv = self._wake_recv
+                self._wake_recv = None
+                if wake_recv is not None:
+                    try:
+                        wake_recv.close(linger=0)
+                    except Exception:
+                        pass
 
     def _receive_request(self, flags=0):
         try:
@@ -708,13 +719,33 @@ class ZmqTransport(RpcTransport):
         thread = self._router_thread
         if thread is not None and thread.is_alive():
             thread.join(2.0)
-        if thread is None and self._router is not None:
+        if (thread is None or not thread.is_alive()) and self._router is not None:
             try:
                 self._router.close(linger=0)
             except Exception:
                 pass
             self._router = None
+        # Usually the router thread already closed the PULL end above. This
+        # fallback covers a stop that races startup before the thread enters
+        # its session.
+        if (thread is None or not thread.is_alive()) and self._wake_recv is not None:
+            try:
+                self._wake_recv.close(linger=0)
+            except Exception:
+                pass
+            self._wake_recv = None
         self._router_thread = None
+        # The PUSH end is created and used on the strategy/adjust side. stop()
+        # runs on that side too; close it under the same lock that protects
+        # _signal_wake so a concurrent late response cannot use a dead socket.
+        with self._wake_lock:
+            wake_send = self._wake_send
+            self._wake_send = None
+            if wake_send is not None:
+                try:
+                    wake_send.close(linger=0)
+                except Exception:
+                    pass
         # If we were a server that published a discovery address, clear it so
         # clients don't keep hitting a dead endpoint.
         if self._actual_bind_address is not None:

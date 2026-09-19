@@ -28,6 +28,7 @@ and that extra work lands on the thread ping is answered from.
 """
 
 import os
+import socket
 import sys
 import threading
 import unittest
@@ -162,6 +163,35 @@ class LoopStillWorksWithoutAPipeTest(unittest.TestCase):
             self.fail("must not propagate: %r" % (exc,))
 
         self.assertIsNone(transport._wake_recv)
+
+
+class WakePipeLifecycleTest(unittest.TestCase):
+    def test_stop_closes_both_ends_of_a_real_wake_pipe(self):
+        """A stopped background server must not leave pyzmq sockets for GC."""
+        probe = socket.socket()
+        try:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        finally:
+            probe.close()
+
+        transport = zt.ZmqTransport(
+            account_id="wake-test",
+            bind_address="tcp://127.0.0.1:%d" % port,
+            recv_timeout_seconds=0.01,
+        )
+        transport.start_receiving(lambda _request: {}, background_threads=True)
+        try:
+            transport._signal_wake()
+            wake_recv = transport._wake_recv
+            wake_send = transport._wake_send
+            self.assertIsNotNone(wake_recv)
+            self.assertIsNotNone(wake_send)
+        finally:
+            transport.stop()
+
+        self.assertTrue(wake_recv.closed)
+        self.assertTrue(wake_send.closed)
 
 
 if __name__ == "__main__":
