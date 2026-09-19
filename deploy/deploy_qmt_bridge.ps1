@@ -282,7 +282,11 @@ if (-not (Select-String -Path $conf -SimpleMatch -Pattern $marker -Quiet)) {
 $svc = Get-Service RedisBigQMT -ErrorAction SilentlyContinue
 if (-not $svc) {
     & "$rdir\Redis-x64-5.0.14\redis-server.exe" --service-install $conf --service-name RedisBigQMT
-    if ($LASTEXITCODE -ne 0) { throw "redis service-install failed" }
+    # Redis-x64 5.0.14 can return a non-zero process status after it has
+    # successfully registered the Windows service. The durable postcondition
+    # is the service registration itself, not that installer exit code.
+    $svc = Get-Service RedisBigQMT -ErrorAction SilentlyContinue
+    if (-not $svc) { throw "redis service-install failed: RedisBigQMT was not registered" }
 }
 $svc = Get-Service RedisBigQMT
 if ($svc.Status -ne "Running") { Start-Service RedisBigQMT }
