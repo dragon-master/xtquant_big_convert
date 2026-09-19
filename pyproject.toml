@@ -28,6 +28,10 @@ classifiers = [
 ]
 dependencies = [
     "pyzmq>=25.0.0",
+    # The public client reconstructs QMT market and factor results as DataFrames.
+    # Keep it here (rather than only in test tooling) so a normal client install
+    # has the documented return types and cache support.
+    "pandas>=1.5.0",
 ]
 
 [project.optional-dependencies]
@@ -43,6 +47,10 @@ msgpack = ["msgpack>=1.0.0"]
 dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
+    # The offline suite exercises MysqlTransport against SQLite and therefore
+    # needs the same connection-pool dependency as the optional mysql extra.
+    "pymysql>=1.0.0",
+    "DBUtils>=3.0.0",
 ]
 
 [project.scripts]
