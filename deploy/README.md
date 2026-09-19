@@ -20,6 +20,7 @@ cd <deploy目录>
 powershell -ExecutionPolicy Bypass -File .\deploy_qmt_bridge.ps1 `
     -QmtDir  "C:\你的券商QMT目录" `
     -Account "资金账号" `
+    -AccountType "STOCK" `
     -WorkDir "C:\qmt_bridge" `
     -Conda `
     -Proxy   "http://127.0.0.1:7897"        # 没有代理就删掉这行
@@ -30,6 +31,14 @@ powershell -ExecutionPolicy Bypass -File .\deploy_qmt_bridge.ps1 `
 做完的事：建客户端环境（`-Conda` 走 miniconda py3.13 前缀环境，否则系统 python venv）并装包 → 拷服务端 4 项进 QMT python 目录 →
 下载/解压 Redis → 注册 Windows 服务（bind 127.0.0.1 + 随机密码 + 192mb 上限）→
 生成服务端/客户端配置 → 放入 `qmt_cli.py`。
+
+从本仓库的 `deploy\` 目录运行时，脚本会自动部署当前源码检出（包括你的 Fork 修改）；把 `deploy\` 单独拷到其他机器时才回退到 PyPI。也可明确指定：
+
+```powershell
+-SourceRepo "G:\Projects\xtquant_big_convert"
+```
+
+`-AccountType` 必须与 QMT 模型交易中绑定的账号类型一致，例如普通股票账户是 `STOCK`，信用账户是 `CREDIT`，期货账户是 `FUTURE`。Redis 部署会生成 `rpc_background_threads=True`，这是该传输方式的低延迟配置。
 
 **Redis 下载慢/中断**（GitHub Releases 国内直连不稳）三种出路，按速度排序：
 1. `-RedisZip "C:\path\Redis-x64-5.0.14.zip"` 离线传入（最快，一次拷贝终身用）

@@ -7,7 +7,9 @@
   Idempotent - safe to re-run. Skips completed steps.
 .PARAMETER QmtDir   Big QMT install root, e.g. C:\JianghaiQMT
 .PARAMETER Account  Capital account id (digits), e.g. 1234567890
+.PARAMETER AccountType  QMT account type, e.g. STOCK / CREDIT / FUTURE
 .PARAMETER WorkDir  Deployment root (default C:\qmt_bridge)
+.PARAMETER SourceRepo  Optional checkout to deploy instead of the PyPI package
 .PARAMETER RedisZip Offline redis zip path; skip GitHub download when provided
 .PARAMETER Proxy    HTTP proxy for downloads, e.g. http://127.0.0.1:7897
 .PARAMETER AllowOrders  Enable order RPCs in the generated server config (off by default)
@@ -15,7 +17,9 @@
 param(
     [Parameter(Mandatory=$true)][string]$QmtDir,
     [Parameter(Mandatory=$true)][string]$Account,
+    [string]$AccountType = "STOCK",
     [string]$WorkDir = "C:\qmt_bridge",
+    [string]$SourceRepo = "",
     [string]$RedisZip = "",
     [string]$RedisUrl = "",
     [string]$Proxy = "",
@@ -29,6 +33,30 @@ param(
 )
 $ErrorActionPreference = "Stop"
 
+$AccountType = $AccountType.Trim().ToUpperInvariant()
+if (-not $AccountType) { throw "AccountType must not be empty" }
+
+# When this script is run from a source checkout, deploy that checkout by
+# default. A copied standalone deploy/ folder has no adjacent pyproject.toml,
+# so it retains the documented PyPI fallback. -SourceRepo makes either choice
+# explicit and is useful when the deploy folder is copied elsewhere.
+$sourceRepoPath = ""
+if ($SourceRepo) {
+    $sourceItem = Get-Item -LiteralPath $SourceRepo -ErrorAction Stop
+    if (-not $sourceItem.PSIsContainer) {
+        throw "SourceRepo must be a directory: $SourceRepo"
+    }
+    $sourceRepoPath = $sourceItem.FullName
+} else {
+    $checkoutRoot = Split-Path -Parent $PSScriptRoot
+    if (Test-Path -LiteralPath (Join-Path $checkoutRoot "pyproject.toml") -PathType Leaf) {
+        $sourceRepoPath = $checkoutRoot
+    }
+}
+if ($sourceRepoPath -and -not (Test-Path -LiteralPath (Join-Path $sourceRepoPath "pyproject.toml") -PathType Leaf)) {
+    throw "SourceRepo does not contain pyproject.toml: $sourceRepoPath"
+}
+
 function Step($m) { Write-Host ""
   Write-Host ("== " + $m) -ForegroundColor Cyan }
 function Ok($m)   { Write-Host ("   [ok] " + $m) -ForegroundColor Green }
@@ -41,6 +69,11 @@ $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIden
 if (-not $isAdmin -and -not $CheckOnly) { throw "Please run from an elevated (Administrator) PowerShell." }
 if ($CheckOnly) {
     Info "check-only mode: reporting state, no writes"
+    if ($sourceRepoPath) {
+        Info "package source: local checkout $sourceRepoPath"
+    } else {
+        Info "package source: PyPI (standalone deploy folder)"
+    }
     $items = [ordered]@{
         "QMT dir"            = Test-Path "$QmtDir\bin.x64\XtItClient.exe"
         "xtquant lib"        = Test-Path "$QmtDir\bin.x64\Lib\site-packages\xtquant"
@@ -130,7 +163,11 @@ $pkgList = & $vpy -m pip list 2>$null | Out-String
 $pipArgs = @("-m","pip","install","-i",$PipIndex,"--upgrade","pip")
 if ($Proxy) { $pipArgs += @("--proxy",$Proxy) }
 & $vpy @pipArgs *> $null
-if ($pkgList -notmatch "xtquant-big-convert") {
+if ($sourceRepoPath) {
+    $sourceSpec = "${sourceRepoPath}[redis]"
+    & $vpy -m pip install $(if ($Proxy) { @("--proxy",$Proxy) } else { @() }) -e $sourceSpec
+    if ($LASTEXITCODE -ne 0) { throw "local source install failed: $sourceRepoPath" }
+} elseif ($pkgList -notmatch "xtquant-big-convert") {
     & $vpy -m pip install $(if ($Proxy) { @("--proxy",$Proxy) } else { @() }) -i $PipIndex "xtquant-big-convert[redis]" pandas
     if ($LASTEXITCODE -ne 0) { throw "pip install failed (check network/proxy)" }
 }
@@ -229,7 +266,7 @@ $allowOrdersPy = if ($AllowOrders) { "True" } else { "False" }
 $localCfg = @"
 # coding: utf-8
 BIGQMT_ACCOUNT_ID = "$Account"
-BIGQMT_ACCOUNT_TYPE = "STOCK"
+BIGQMT_ACCOUNT_TYPE = "$AccountType"
 
 BIGQMT_REDIS_CONFIG = {
     "host": "127.0.0.1",
@@ -240,7 +277,7 @@ BIGQMT_REDIS_CONFIG = {
     "rpc_allow_order_methods": $allowOrdersPy,
     "rpc_process_in_listener": True,
     "rpc_listener_methods": ("*",),
-    "rpc_background_threads": False,
+    "rpc_background_threads": True,
     "schedule_adjust": True,
     "schedule_adjust_interval": "100nMilliSecond",
     "full_tick_cache_enabled": False,
