@@ -10,6 +10,7 @@
 .PARAMETER AccountType  QMT account type, e.g. STOCK / CREDIT / FUTURE
 .PARAMETER WorkDir  Deployment root (default C:\qmt_bridge)
 .PARAMETER SourceRepo  Optional checkout to deploy instead of the PyPI package
+.PARAMETER ClientPython  Existing client Python to reuse without creating an environment
 .PARAMETER RedisZip Offline redis zip path; skip GitHub download when provided
 .PARAMETER Proxy    HTTP proxy for downloads, e.g. http://127.0.0.1:7897
 .PARAMETER AllowOrders  Enable order RPCs in the generated server config (off by default)
@@ -20,6 +21,7 @@ param(
     [string]$AccountType = "STOCK",
     [string]$WorkDir = "C:\qmt_bridge",
     [string]$SourceRepo = "",
+    [string]$ClientPython = "",
     [string]$RedisZip = "",
     [string]$RedisUrl = "",
     [string]$Proxy = "",
@@ -57,6 +59,15 @@ if ($sourceRepoPath -and -not (Test-Path -LiteralPath (Join-Path $sourceRepoPath
     throw "SourceRepo does not contain pyproject.toml: $sourceRepoPath"
 }
 
+$clientPythonPath = ""
+if ($ClientPython) {
+    $clientPythonItem = Get-Item -LiteralPath $ClientPython -ErrorAction Stop
+    if ($clientPythonItem.PSIsContainer) {
+        throw "ClientPython must be a Python executable: $ClientPython"
+    }
+    $clientPythonPath = $clientPythonItem.FullName
+}
+
 function Step($m) { Write-Host ""
   Write-Host ("== " + $m) -ForegroundColor Cyan }
 function Ok($m)   { Write-Host ("   [ok] " + $m) -ForegroundColor Green }
@@ -74,12 +85,13 @@ if ($CheckOnly) {
     } else {
         Info "package source: PyPI (standalone deploy folder)"
     }
+    if ($clientPythonPath) { Info "client Python: reuse $clientPythonPath" }
     $items = [ordered]@{
         "QMT dir"            = Test-Path "$QmtDir\bin.x64\XtItClient.exe"
         "xtquant lib"        = Test-Path "$QmtDir\bin.x64\Lib\site-packages\xtquant"
         "server files"       = Test-Path "$QmtDir\python\BIGQMT_REDIS_DRYRUN.py"
         "server local config"= Test-Path "$QmtDir\python\bigqmt_signal_trader_local_config.py"
-        "client env"         = ((Test-Path "$WorkDir\envs\bigqmt-client\Scripts\python.exe") -or (Test-Path "$WorkDir\envs\bigqmt\python.exe"))
+        "client env"         = if ($clientPythonPath) { Test-Path -LiteralPath $clientPythonPath } else { ((Test-Path "$WorkDir\envs\bigqmt-client\Scripts\python.exe") -or (Test-Path "$WorkDir\envs\bigqmt\python.exe")) }
         "redis binaries"     = Test-Path "$WorkDir\redis\Redis-x64-5.0.14\redis-server.exe"
         "redis password file"= Test-Path "$WorkDir\redis\redis_password.txt"
         "redis service"      = [bool](Get-Service RedisBigQMT -ErrorAction SilentlyContinue)
@@ -99,13 +111,24 @@ if (-not (Test-Path "$QmtDir\bin.x64\XtItClient.exe")) { throw "Big QMT not foun
 if (-not (Test-Path "$QmtDir\bin.x64\Lib\site-packages\xtquant")) {
     throw "xtquant library missing. Open QMT and run its 'download python libraries' first."
 }
-$pyExe = (Get-Command python -ErrorAction SilentlyContinue).Source
-if (-not $pyExe -and -not $Conda) { throw "System Python not found on PATH (>= 3.10), or pass -Conda to use miniconda." }
-Ok "QMT found; xtquant present; python: $pyExe"
+$pyExe = ""
+if (-not $clientPythonPath) {
+    $pyExe = (Get-Command python -ErrorAction SilentlyContinue).Source
+    if (-not $pyExe -and -not $Conda) { throw "System Python not found on PATH (>= 3.10), pass -Conda, or pass -ClientPython." }
+}
+$pythonLabel = if ($clientPythonPath) { $clientPythonPath } else { $pyExe }
+Ok "QMT found; xtquant present; python: $pythonLabel"
 
 # ---- 1. client environment (conda py313 or venv) --------------------------
 Step "1/7 client env (xtquant-big-convert + pandas)"
-if ($Conda) {
+if ($clientPythonPath) {
+    $vpy = $clientPythonPath
+    & $vpy -c "import bigqmt_signal_trader, bigqmt_signal_trader_strategy, pandas, redis"
+    if ($LASTEXITCODE -ne 0) {
+        throw "ClientPython is missing this bridge or its Redis dependencies: $vpy"
+    }
+    Ok "using existing client Python: $vpy"
+} elseif ($Conda) {
     $condaExe = (Get-Command conda -ErrorAction SilentlyContinue).Source
     if (-not $condaExe) {
         foreach ($cand in @("$env:USERPROFILE\miniconda3\Scripts\conda.exe",
@@ -157,21 +180,23 @@ if ($Conda) {
         if ($LASTEXITCODE -ne 0) { throw "venv creation failed" }
     }
 }
-& $vpy -m pip --version *> $null
-if ($LASTEXITCODE -ne 0) { & $vpy -m ensurepip --upgrade }
-$pkgList = & $vpy -m pip list 2>$null | Out-String
-$pipArgs = @("-m","pip","install","-i",$PipIndex,"--upgrade","pip")
-if ($Proxy) { $pipArgs += @("--proxy",$Proxy) }
-& $vpy @pipArgs *> $null
-if ($sourceRepoPath) {
-    $sourceSpec = "${sourceRepoPath}[redis]"
-    & $vpy -m pip install $(if ($Proxy) { @("--proxy",$Proxy) } else { @() }) -e $sourceSpec
-    if ($LASTEXITCODE -ne 0) { throw "local source install failed: $sourceRepoPath" }
-} elseif ($pkgList -notmatch "xtquant-big-convert") {
-    & $vpy -m pip install $(if ($Proxy) { @("--proxy",$Proxy) } else { @() }) -i $PipIndex "xtquant-big-convert[redis]" pandas
-    if ($LASTEXITCODE -ne 0) { throw "pip install failed (check network/proxy)" }
+if (-not $clientPythonPath) {
+    & $vpy -m pip --version *> $null
+    if ($LASTEXITCODE -ne 0) { & $vpy -m ensurepip --upgrade }
+    $pkgList = & $vpy -m pip list 2>$null | Out-String
+    $pipArgs = @("-m","pip","install","-i",$PipIndex,"--upgrade","pip")
+    if ($Proxy) { $pipArgs += @("--proxy",$Proxy) }
+    & $vpy @pipArgs *> $null
+    if ($sourceRepoPath) {
+        $sourceSpec = "${sourceRepoPath}[redis]"
+        & $vpy -m pip install $(if ($Proxy) { @("--proxy",$Proxy) } else { @() }) -e $sourceSpec
+        if ($LASTEXITCODE -ne 0) { throw "local source install failed: $sourceRepoPath" }
+    } elseif ($pkgList -notmatch "xtquant-big-convert") {
+        & $vpy -m pip install $(if ($Proxy) { @("--proxy",$Proxy) } else { @() }) -i $PipIndex "xtquant-big-convert[redis]" pandas
+        if ($LASTEXITCODE -ne 0) { throw "pip install failed (check network/proxy)" }
+    }
+    Ok "venv ready: $vpy"
 }
-Ok "venv ready: $vpy"
 
 # ---- 2. server files into QMT python dir ----------------------------------
 Step "2/7 copy bridge server files into QMT python dir"
@@ -179,6 +204,12 @@ $src = (& $vpy -c "import bigqmt_signal_trader_strategy as m, os; print(os.path.
 $dst = "$QmtDir\python"
 if ($src -eq $dst) {
     throw ("source resolved to the QMT python dir itself (" + $src + ") - the import picked up already-deployed files. Run the script from any other directory (e.g. the deploy folder).")
+}
+if ($sourceRepoPath) {
+    $expectedSource = [IO.Path]::GetFullPath((Join-Path $sourceRepoPath "src"))
+    if (-not $src.StartsWith($expectedSource, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "client Python resolved bridge files outside SourceRepo: $src"
+    }
 }
 foreach ($item in @("bigqmt_signal_trader","bigqmt_signal_trader_strategy.py",
                     "bigqmt_signal_trader_redis_rpc_runtime.py","BIGQMT_REDIS_DRYRUN.py")) {

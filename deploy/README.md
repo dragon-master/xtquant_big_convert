@@ -5,11 +5,12 @@
 ## 前提（脚本不负责的部分）
 1. 已安装大 QMT 客户端并登录交易
 2. QMT 菜单里点过 **下载 python库**（脚本会检查 `bin.x64\Lib\site-packages\xtquant`）
-3. Python 二选一：
+3. Python 三选一：
    - **miniconda/anaconda（推荐，加 `-Conda` 参数）**——已装则直接用；**没装会自动下载
      Miniconda 官方安装器静默装到 `<WorkDir>\miniconda3`**（官方源国内直连可达；
      离线机器可提前下载安装器后传 `-MinicondaUrl "C:\temp\Miniconda3-....exe"`）
    - 或系统 Python ≥ 3.10 在 PATH 上（默认走 venv）
+   - 或传 `-ClientPython "G:\Projects\xtquant_big_convert\.venv\Scripts\python.exe"` 复用已有环境；脚本不会在 `WorkDir` 下再创建 Python 环境或改动其依赖
    - 注意：`-WorkDir` 路径不要含空格（Miniconda 静默安装的限制）
 4. 管理员 PowerShell
 
@@ -22,13 +23,13 @@ powershell -ExecutionPolicy Bypass -File .\deploy_qmt_bridge.ps1 `
     -Account "资金账号" `
     -AccountType "STOCK" `
     -WorkDir "C:\qmt_bridge" `
-    -Conda `
+    -ClientPython "G:\Projects\xtquant_big_convert\.venv\Scripts\python.exe" `
     -Proxy   "http://127.0.0.1:7897"        # 没有代理就删掉这行
 ```
 
 脚本幂等，可重复跑。**pip / conda 包源 / Miniconda 安装器默认全部走清华镜像**（国内实测 ~2MB/s；
 需要换回官方源时传 `-PipIndex https://pypi.org/simple`，conda/Miniconda 同理见脚本内默认值）。
-做完的事：建客户端环境（`-Conda` 走 miniconda py3.13 前缀环境，否则系统 python venv）并装包 → 拷服务端 4 项进 QMT python 目录 →
+做完的事：建客户端环境（`-Conda` 走 miniconda py3.13 前缀环境，否则系统 python venv；传 `-ClientPython` 则直接复用）并装包 → 拷服务端 4 项进 QMT python 目录 →
 下载/解压 Redis → 注册 Windows 服务（bind 127.0.0.1 + 随机密码 + 192mb 上限）→
 生成服务端/客户端配置 → 放入 `qmt_cli.py`。
 
@@ -53,10 +54,11 @@ powershell -ExecutionPolicy Bypass -File .\deploy_qmt_bridge.ps1 `
 
 ## 部署后只剩两步人工操作
 1. QMT → 模型交易 → 加载 `<QMT目录>\python\BIGQMT_REDIS_DRYRUN.py` → **运行模式切"实盘"** → 启动
-2. 验证（python 路径按所用路线二选一——`-Conda` 用第一行，系统 python venv 用第二行）：
+2. 验证（Python 路径按所用路线选择；复用项目开发环境时用第三行）：
    ```powershell
    & "C:\qmt_bridge\envs\bigqmt\python.exe" "C:\qmt_bridge\client\qmt_cli.py" ping
    & "C:\qmt_bridge\envs\bigqmt-client\Scripts\python.exe" "C:\qmt_bridge\client\qmt_cli.py" ping
+   & "G:\Projects\xtquant_big_convert\.venv\Scripts\python.exe" "G:\Projects\qmt_bridge\client\qmt_cli.py" ping
    ```
    > PowerShell 里执行带引号的路径必须以 `&` 开头；行尾不要多引号。
 
