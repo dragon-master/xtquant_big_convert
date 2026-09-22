@@ -450,6 +450,33 @@ def _as_list(value):
     return [value]
 
 
+# Big QMT m_nOpType -> MiniQMT order_type for the credit family (#330). 27-32
+# are the same number in both; big QMT's 33/34 (担保品买入/卖出) are MiniQMT's
+# CREDIT_BUY/CREDIT_SELL (23/24); the 专项 family is 70-75 there, 40-45 here.
+# 80-83 (可转债转股/回售) have no MiniQMT constant and pass through.
+_CREDIT_ORDER_TYPE_BY_OP = {
+    27: 27, 28: 28, 29: 29, 30: 30, 31: 31, 32: 32,
+    33: 23, 34: 24,
+    70: 40, 71: 41, 72: 42, 73: 43, 74: 44, 75: 45,
+    80: 80, 81: 81, 82: 82, 83: 83,
+}
+
+
+def _credit_order_type_from_op(op_type, fallback):
+    """The MiniQMT order_type for a row's native opType, else ``fallback``.
+
+    query_stock_orders used to derive order_type from BUY/SELL alone, so a
+    融资买入 (opType 27) read as STOCK_BUY 23 (#330). Only the credit and
+    convertible families are mapped; ordinary 23/24 and the futures/option
+    numbers keep whatever the side-based logic decided.
+    """
+    try:
+        value = int(op_type)
+    except (TypeError, ValueError):
+        return fallback
+    return _CREDIT_ORDER_TYPE_BY_OP.get(value, fallback)
+
+
 def _account_type_name(value):
     """The NAME of an account type, whatever form it arrives in.
 
@@ -2785,6 +2812,60 @@ class BigQmtXtData:
         except Exception:
             return False
 
+    @staticmethod
+    def _is_placeholder_frame(frame):
+        """One code's frame is a no-trade placeholder: every bar has
+        ``volume == 0`` and ``suspendFlag == 1``.
+
+        Big QMT answers a window it has no local bars for with placeholder
+        bars rather than an empty frame, and the fill differs by build. The
+        国金 terminal fills zeros (the all-zero shape ``_is_all_zero_any``
+        catches). A 华泰 terminal on 0.3.40 filled the previous close into
+        open/high/low/close instead (#339, @wolfeee: 002594.SZ 1m from
+        20260918 answered 150 bars dated 20260919 -- a Saturday -- all at
+        84.3, volume 0, suspendFlag 1). Nonzero prices slip past the
+        all-zero detector, so the heal never fired and the caller was handed
+        a day of flat fake bars with nothing said. Both columns are required:
+        a frame without ``suspendFlag`` (the FormulaServer six-column path)
+        never matches, and one nonzero volume anywhere means real trades.
+        """
+        cols = getattr(frame, "columns", None)
+        if cols is None:
+            return False
+        cols = list(cols)
+        if "volume" not in cols or "suspendFlag" not in cols:
+            return False
+        if len(frame) == 0:
+            return False
+        try:
+            return bool((frame["volume"] == 0).all() and (frame["suspendFlag"] == 1).all())
+        except Exception:
+            return False
+
+    @staticmethod
+    def _is_placeholder_all(data):
+        """Every served frame is a placeholder (see ``_is_placeholder_frame``).
+
+        ``all`` rather than ``any`` on purpose: a genuinely suspended stock
+        answers the same shape truthfully, and one of those inside a
+        portfolio read must not turn the whole read into a per-call heal
+        (download + sleep + re-read). Every code flat at once is the
+        raw-store-not-populated signal, the same reasoning as the majority
+        guard on the none-adjusted branch.
+        """
+        try:
+            cols = getattr(data, "columns", None)
+            if cols is not None:
+                return BigQmtXtData._is_placeholder_frame(data)
+            if isinstance(data, dict) and data:
+                frames = [v for v in data.values() if getattr(v, "columns", None) is not None]
+                if not frames:
+                    return False
+                return all(BigQmtXtData._is_placeholder_frame(v) for v in frames)
+            return False
+        except Exception:
+            return False
+
     def _ensure_server_raw(self, codes, period, start_time, end_time):
         """Trigger a server-side raw download so adjusted bars can be computed."""
         try:
@@ -2815,13 +2896,20 @@ class BigQmtXtData:
     def _heal_adjusted(self, method, params, data, wait_seconds=2.0, timeout_seconds=None):
         """Self-heal reads served from an unready raw store: if the adjusted
         pull came back all-zero, or a none-adjusted pull came back missing
-        most requested codes, trigger a server-side raw download, wait for
-        async landing, retry once."""
+        most requested codes, or every code came back as a no-trade
+        placeholder frame (#339), trigger a server-side raw download, wait
+        for async landing, retry once."""
         dividend_type = str(params.get("dividend_type") or "none").lower()
         codes = list(params.get("stock_list") or params.get("stock_code") or [])
         if not codes:
             return data
-        if dividend_type in ("", "none"):
+        if self._is_placeholder_all(data):
+            # Applies on both branches: the placeholder fill is a raw-store
+            # answer, not an adjustment artefact, so a none-adjusted read
+            # gets the same flat bars -- and those codes count as *served*,
+            # which is why the missing-majority guard below never sees them.
+            pass
+        elif dividend_type in ("", "none"):
             # None-adjusted bars are never zero-filled, so the all-zero
             # detector does not apply -- a *missing* code means the server
             # has no raw bars for it at all. Big QMT's raw store is not
@@ -2847,8 +2935,27 @@ class BigQmtXtData:
         )
         time.sleep(wait_seconds)
         if timeout_seconds is not None:
-            return self.client.call(method, params, timeout_seconds=timeout_seconds)
-        return self._call(method, **params)
+            healed = self.client.call(method, params, timeout_seconds=timeout_seconds)
+        else:
+            healed = self._call(method, **params)
+        if self._is_placeholder_all(healed):
+            # The download did not change the answer: either the terminal
+            # has no data to download for this window (a real suspension,
+            # or the reporter's terminal where the download RPC itself
+            # answers False, #339) -- say so rather than hand back a flat
+            # frame that reads like bars.
+            log.warning(
+                "%s %s %s %s~%s: every bar is volume 0 / suspendFlag 1 after a "
+                "server-side download and retry. These are Big QMT placeholder "
+                "bars, not trades -- the terminal has no local %s data for this "
+                "window. Check download_history_data2 on this terminal "
+                "(probe_capabilities -> qmt_globals) or download the period in "
+                "the terminal's 数据管理 first.",
+                method, ",".join(codes[:5]) + (",..." if len(codes) > 5 else ""),
+                params.get("period", "1d"), params.get("start_time", ""),
+                params.get("end_time", ""), params.get("period", "1d"),
+            )
+        return healed
 
     def _pull_and_cache(self, codes, period, start_time, end_time, count, dividend_type="none"):
         """Fetch codes over RPC (get_market_data_ex already caches them)."""
@@ -3147,7 +3254,7 @@ class BigQmtXtData:
                           start_time=start_time, end_time=end_time)
         return _divid_factors_frame(data)
 
-    def download_history_data2(self, stock_list, period, start_time="", end_time="", callback=None, incrementally=None, dividend_type="none", chunk_size=None, download_timeout_seconds=180.0, data_wait_seconds=60.0):
+    def download_history_data2(self, stock_list, period, start_time="", end_time="", callback=None, incrementally=None, dividend_type="none", chunk_size=None, download_timeout_seconds=180.0, data_wait_seconds=10.0):
         """Pull bars from Big QMT over RPC and cache them locally, in batches.
 
         Mirrors xtdata.download_history_data2: after this, get_local_data(..., the
@@ -3168,6 +3275,15 @@ class BigQmtXtData:
 
         ``download_timeout_seconds`` covers the server-side download only; it is
         generous because a cold code with a wide window can take minutes.
+
+        ``data_wait_seconds`` is how long a batch keeps re-polling for codes the
+        first pull came back empty for. The server download returns after the
+        data landed (measured: 20,726 1m bars readable 0.3s after a 0.6-1.4s
+        download), so an empty first pull almost always means the terminal
+        has nothing for that code (suspended, new, delisted) and will not get
+        it by waiting. The old default of 60s made one such code hold its
+        whole batch for a minute (#339: "12s per contract" on 300 contracts).
+        10s is a few polls, enough for a terminal that lands data late.
 
         The server-side download is best-effort while the client pull can still
         save it (cache enabled), but with the local cache disabled it is the
@@ -3259,7 +3375,9 @@ class BigQmtXtData:
                     count=-1,
                     dividend_type=dividend_type,
                     fill_data=False,  # fill 会用全 0 占位行冒充数据，轮询判定必须关掉
-                    timeout_seconds=float(data_wait_seconds),
+                    # The RPC timeout for one pull is not the poll budget: a
+                    # batch of 300 codes x 20k bars is a multi-second reply.
+                    timeout_seconds=max(float(data_wait_seconds), 60.0),
                     # 等的就是刚提交的那笔下载。heal 看到「还没落地」会把它原样
                     # 再提交一遍、睡 2 秒、再读——每轮如此，等待目标被反复推后，
                     # 单票冷启动必然打满 60 秒（#275）。轮询里的读不参与 heal。
@@ -4144,14 +4262,25 @@ class BigQmtXtTrader:
         return 0
 
     def connect(self):
-        if self.client.account_id:
-            pong = self.client.call("ping")
-            self._note_server_account_type(pong)
-            mismatch = warn_on_version_mismatch(pong)
-            if mismatch and auto_sync_enabled():
-                self.sync_deployment()
-        self._fire_account_status()
-        return 0
+        try:
+            if self.client.account_id:
+                pong = self.client.call("ping")
+                self._note_server_account_type(pong)
+                mismatch = warn_on_version_mismatch(pong)
+                if mismatch and auto_sync_enabled():
+                    self.sync_deployment()
+            self._fire_account_status()
+            return 0
+        except Exception:
+            # connect 失败必须拆掉 start() 拉起的事件监听线程。否则它持有的
+            # Redis pubsub 订阅(每实例 4 个 exec 事件频道)随丢弃的实例永久
+            # 留在服务端: 调用方重连风暴每次重试泄漏一个, 实测单日 8000+ 个
+            # subscribe 连接, 逼近 maxclients 后整个 Redis 拒绝新连接。
+            try:
+                self.stop()
+            except Exception:
+                log.exception("connect failed and event listener teardown failed")
+            raise
 
     def sync_deployment(self, dry_run=False):
         """Push this client's package into the QMT python directory.
@@ -5666,6 +5795,16 @@ class BigQmtXtTrader:
             "wait_for_sysid": False,
         })
 
+    def _has_push_channel(self):
+        """Whether exec events can reach this client at all (#345).
+
+        redis carries them on pub/sub, zmq on the PUB socket; pipe / mysql /
+        shm have no push path, so nothing the server emits after the reply
+        ever arrives.
+        """
+        transport_name = str(getattr(self.client, "transport_name", "redis") or "redis").lower()
+        return transport_name in ("redis", "", "default", "zmq")
+
     def _submit_async_single(self, seq, args, kwargs):
         """Submit one job and enqueue its outcome. Runs on the order worker."""
         stock_code = str(kwargs.get("stock_code") or (args[1] if len(args) > 1 else ""))
@@ -5675,7 +5814,13 @@ class BigQmtXtTrader:
             # wait_settlement=False：passorder 一返回就应答，不在 worker 里等
             # 服务端结算（那是 #69 要的吞吐）。委托号从推送事件学——屏障暂存的
             # 委托事件里会带上（触发 response 前至多等 2s，学不到就回落 remark）。
-            result = self.order_stock_result(*args, wait_settlement=False, **kwargs)
+            #
+            # 没有推送通道的传输（pipe / mysql）学不到任何事件，服务端为拒单
+            # 推的 order_error 也到不了（#345）。那里让 worker 等服务端结算：
+            # 调用方本来就不阻塞，而 server_error 会走下面的 except 变成
+            # on_order_error，否则一张资金不足被终端拦下的单永远没有回音。
+            result = self.order_stock_result(
+                *args, wait_settlement=not self._has_push_channel(), **kwargs)
         except Exception as exc:
             self._enqueue_async_outcome({
                 "kind": "error", "seq": seq, "remark": remark,
@@ -6430,6 +6575,7 @@ class BigQmtXtTrader:
         action = item.get("action")
         order_type = (option_order_type(item.get("direction"), item.get("offset_flag"), action)
                       if self._account_type_value(item) == 6 else _action_to_order_type(action))
+        order_type = _credit_order_type_from_op(item.get("op_type"), order_type)
         order_sysid = str(item.get("order_sys_id") or item.get("order_sysid") or item.get("order_id") or "")
         return CompatObject(
             account_id=account_id,
@@ -6477,6 +6623,7 @@ class BigQmtXtTrader:
         action = item.get("action")
         order_type = (option_order_type(item.get("direction"), item.get("offset_flag"), action)
                       if self._account_type_value(item) == 6 else _action_to_order_type(action))
+        order_type = _credit_order_type_from_op(item.get("op_type"), order_type)
         order_sysid = str(item.get("order_sys_id") or item.get("order_sysid") or "")
         trade_id = str(item.get("trade_id") or "")
         traded_volume = _safe_int(item.get("volume", item.get("traded_volume")))

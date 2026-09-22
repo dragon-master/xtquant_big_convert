@@ -62,7 +62,7 @@ python -m bigqmt_signal_trader.init_config
 
 几个不问、直接定死的：
 
-- **`rpc_background_threads` 按传输选**（redis `True`、zmq/pipe `False`）——选反了差 4~37 倍
+- **`rpc_background_threads` 一律 `False`**（adjust 线程 drain）——后台线程模式每次跨线程交接付一个 tick，redis 也不例外（#343）
 - **`rpc_allow_order_methods` 默认 `False`**——打开前会明确提示：任何能连上这条通道的程序都可以下单
 - 选了**无 redis 单文件**会自动把传输改成 zmq，不会留下一份声称用 redis 的配置
 
@@ -272,7 +272,7 @@ seq = xt_trader.order_stock_async(acc, "600654.SH", 23, 100, 11, 2.95, "rpc_test
 | `on_order_stock_async_response(seq, resp)` | 异步下单提交成功 | ✅（实盘）|
 | `on_stock_order(order)` | 委托状态变化（已报 50 / 已成 56 / 废单 57）| ✅（实盘）|
 | `on_stock_trade(trade)` | 成交回报 | ✅ |
-| `on_order_error(err)` | 废单/拒单（服务端检测 status=57 推送）| ✅（实盘）|
+| `on_order_error(err)` | 废单/拒单（服务端检测 status=57 推送）；**终端在下单前就拦下的单**（资金/仓位不足、价格越界、无权限——终端弹窗、不建委托记录、没有任何回调）由服务端结算到期查不到时补推，`error_msg` 以 `passorder submitted but order not found in system` 开头，`source="settlement"`（#345 起）| ✅（实盘）/ 补推未实测 |
 | `on_cancel_error(err)` | 撤单失败 | ✅ |
 | `on_cancel_order_stock_async_response` | 异步撤单回报 | ✅ |
 
@@ -573,33 +573,40 @@ xt_trader.reload_status()            # -> {'ok': True, 'modules_purged': 28,
 
 ### 可插拔传输层
 
-实测（2026-09-08 盘中，同一台实盘终端，`schedule_adjust_interval:
-"100nMilliSecond"`）。方法覆盖 **100 个只读接口**，每个跑 5 次取中位，再对全部
-方法取分位——不是挑一两个快的报数：
+**决定延迟的是线程模式，不是传输。** 2026-09-22 在同一台实盘终端（0.3.50，
+`schedule_adjust_interval: "100nMilliSecond"`）把四种组合各重启一次、同一组只读探针各
+跑 20 轮，min / median / max（ms）：
 
-| 传输 + 模式 | 延迟 p50 | p90 | 跨机 | 适用场景 |
-|------|---------|-----|------|---------|
-| **redis + 后台线程**（默认）| **3.4ms** | 25.2ms | ✅ | 生产默认，最快 |
-| **zmq + drain** | 15.8ms | 94.7ms | ✅ | 无 redis 时的首选 |
-| redis + drain | 30.7ms | 93.4ms | ✅ | 不推荐，比默认慢 9 倍 |
-| **pipe + drain** | 94.4ms | 95.6ms | ❌ | 白名单拒 socket 时唯一可用 |
-| pipe + 后台线程 | 189.0ms | 296.8ms | ❌ | 不推荐 |
-| zmq + 后台线程 | 592.9ms | 697.5ms | ✅ | 旧默认，**不要用** |
-| **mysql** | ~105ms | — | ✅ | 兼容兜底 |
-| **shm** | — | — | ❌ | 接口预留（未实现）|
+| 方法 | redis + 后台线程 | zmq + 后台线程 | zmq + drain | redis + drain |
+|---|---|---|---|---|
+| ping | 199 / 407 / 605 | 98 / 103 / 303 | 10 / 87 / 108 | 23 / 102 / 106 |
+| get_full_tick（1 只） | 199 / 338 / 473 | 8 / 196 / 306 | 8 / 90 / 107 | 26 / 102 / 107 |
+| get_instrument_detail | 132 / 208 / 373 | 99 / 195 / 211 | 7 / 88 / 104 | 33 / 102 / 107 |
+| query_stock_positions | 102 / 197 / 320 | 396 / 490 / 600 | 8 / 88 / 103 | 85 / 103 / 109 |
+| query_stock_orders | 33 / 175 / 200 | 399 / 493 / 613 | 4 / 88 / 105 | 86 / 102 / 109 |
 
-**同一个传输配错模式，差 4~37 倍**——这比选哪个传输更要紧：
+- **drain**（`rpc_background_threads: False`）：adjust 线程自己收 / 处理 / 发，一个请求最多等
+  一个 tick，`handle` 0–1ms、`return` 1–5ms，所以 max 卡在 ~105ms
+- **后台线程**（`True`）：收包线程每拿一次 GIL 就付约一个 tick。往返次数决定延迟——
+  redis 回包 8 次往返 ≈ 400ms；zmq 的 ping 1–2 次 ≈ 100–200ms；zmq 上走 adjust 的交易查询
+  收→丢队列→adjust 处理→回 router 线程发，4–5 次 ≈ 500ms
 
-```
-zmq    592.9ms -> 15.8ms   （drain 快 37 倍）
-pipe   189.0ms -> 94.4ms   （drain 快 2 倍）
-redis    3.4ms -> 30.7ms   （drain 反而慢 9 倍）
-```
+所以 **`rpc_background_threads` 一律 `False`**，redis 也是。0.3.28 那张「redis + 后台线程
+3.4ms 最快」的表是真的测出来的，但测在**重启后的回放窗口**里：策略一启动 QMT 先回放历史
+K 线，adjust 跟着每根 K 线跑（日志 `adjust cadence: ticks=51429 ... over 10s`，每秒 5000 拍），
+那几十秒里什么 RPC 都是毫秒级；回放完 `run_time` 才是 10Hz，drain 一拍 ~100ms、后台线程
+每条命令一拍。稳态下 redis + 后台线程是四种里最慢的（#343 的报告就是这个）。0.3.46 及之前
+后台线程模式下 adjust 每拍还会 LPOP 一次，后台线程忙着等 GIL 时请求被 adjust 拿走一拍答完，
+所以体感是 ~100ms 和 500–900ms 混着来；#321 关掉那次 LPOP 后全是 500–900ms（#351 说的
+「变慢」就是这个），drain 则是全部一拍。`bigqmt-init` 从 0.3.51 起对所有传输都写 `False`；
+**旧配置里显式写着 `True` 的不会自动切，改成 `False` 重启一次。**
+自己测延迟先看日志 cadence 回到 `ticks=100` 再测。
 
-`rpc_background_threads` 控制这个开关。**redis 是唯一后台线程更快的**：它的
-`brpop` 阻塞唤醒是即时的，而 zmq / pipe 的后台线程都要付跨线程 GIL 交接的
-代价（每次交接约一个 adjust tick）。默认值已经按传输分别选对，没有特别理由
-不要改。
+传输本身的取舍：redis 跨机、回报有 stream 短时回放、下载任务和全市场快照缓存都在；
+zmq 同机免 Redis；pipe 白名单拒 socket 时唯一可用（跨机 ❌）；mysql 兼容兜底；shm 预留。
+**pipe / mysql 没有推送通道**：`on_stock_order` / `on_stock_trade` / `on_order_error` 一条都到不了
+（只有 redis pub/sub 和 zmq PUB 能推）。那里的 `order_stock_async` 会改成等服务端结算再回
+（调用方照样不阻塞），拒单靠 `server_error` 变成 `on_order_error`；成交要自己 `query_stock_trades`。
 
 六种渠道返回的**数据完全一致**：100 个方法逐项比对结构指纹（字段名 + 嵌套
 形状），零差异；另取 14 个方法做 sha256 全精度逐字节比对（zmq vs redis），
@@ -1279,7 +1286,7 @@ BIGQMT_REDIS_CONFIG = {
     #   注意 zmq 实测比 redis 慢（ping 95ms vs 10ms，交易查询 95ms vs 4ms），
     #   它的用途是「这台机器没有 redis」，不是低延迟。
     # "transport": "zmq",
-    # 切 mysql（兼容兜底）：需装 pymysql+DBUtils，同样自动开 background_threads。
+    # 切 mysql（兼容兜底）：需装 pymysql+DBUtils。
     # "transport": "mysql",
     # "mysql": {"driver":"pymysql","host":"...","port":3306,"user":"root",
     #           "password":"...","database":"bigqmt_rpc","charset":"utf8mb4"},
@@ -1287,17 +1294,16 @@ BIGQMT_REDIS_CONFIG = {
     "rpc_allow_order_methods": False,    # 下单默认关闭
     "rpc_process_in_listener": True,     # 只读请求在收包线程直接处理（低延迟）
     "rpc_listener_methods": ("*",),      # * = 所有只读方法
-    "rpc_background_threads": True,      # redis 用后台收包线程（最快）
+    "rpc_background_threads": False,     # adjust 线程 drain；True 每次跨线程交接付一个 tick（#343）
     "schedule_adjust": True,
     "schedule_adjust_interval": "100nMilliSecond",
 }
 ```
 
-> **`rpc_background_threads` 按传输选，没有一个值对所有传输都最好**（实测见上面的传输对比表）：
-> redis 用 `True`（3.4ms，`brpop` 唤醒是即时的）；zmq / pipe / mysql 用 `False`
-> 走 adjust drain（zmq 15.8ms），因为它们的后台线程每次都要付跨线程 GIL 交接，
-> 约一个 adjust tick。zmq 配 `True` 是 592.9ms，慢 37 倍。不写这个键则沿用历史
-> 默认（开后台线程）—— 对 redis 正好是对的，对 zmq / pipe 不是。向导按传输替你定好了。
+> **`rpc_background_threads` 一律 `False`**（实测见上面「可插拔传输层」那张四列表）：
+> drain 模式一个请求最多等一个 adjust tick；后台线程每拿一次 GIL 付一个 tick，redis 回包
+> 8 次往返就是 400ms（#343）。不写这个键，0.3.51 起各传输默认也是 drain；旧配置里写着
+> `True` 的改掉重启。`True` 只留给没有 drain 实现的传输。
 >
 > 安全性不依赖这个开关：碰交易上下文的方法（`LISTENER_DEFERRED_METHODS`）在展开
 > listener 名单时被无条件剔除，任何配置都无法把它们排到后台线程上（#244）。
@@ -1528,20 +1534,24 @@ BIGQMT_REDIS_CONFIG = {
 
 ## 实测延迟对比（真实直连 QMT）
 
-三种传输全部实测，端到端连接真实 QMT 进程，n=15/方法：
+稳态（回放窗口结束、`adjust cadence: ticks=100`）下，2026-09-22 同一台实盘终端，
+`100nMilliSecond`，每种组合重启后等 cadence 回到 10Hz 再测，min / median / max（ms）：
 
-| 传输 | ping p50 | ping p90 | 交易查询 p50 | 串行吞吐（ping / 交易查询）|
-|------|---------|---------|------------|------------------------|
-| **Redis** | **10ms** | 105ms | **4ms** | **20 / 195 次每秒** |
-| **ZMQ**（drain，#183）| 95ms | 110ms | 95ms | 10 / 10 次每秒 |
-| **ZMQ**（后台线程，0.3.21 前的默认）| 405ms | 408ms | 607ms | 2.4 / 1.7 次每秒 |
-| **MySQL** | ~104ms | — | — | — |
+| 传输 + 模式 | ping | query_stock_positions | 说明 |
+|------|------|------|------|
+| **redis + drain**（默认）| 23 / 102 / 106 | 85 / 103 / 109 | 一拍；跨机、回报有 stream 回放 |
+| **zmq + drain** | 10 / 87 / 108 | 8 / 88 / 103 | 一拍；没有 redis 时用 |
+| redis + 后台线程 | 199 / 407 / 605 | 102 / 197 / 320 | 每条 Redis 命令一拍 |
+| zmq + 后台线程 | 98 / 103 / 303 | 396 / 490 / 600 | 交易查询要跨两次线程 |
+| **MySQL** | ~104 | — | 轮询，仅作兜底 |
 
-**生产推荐 Redis**，而且它就是实测最快的那个 —— 早期版本说「ZMQ 理论最快」是错的。
-ZMQ 的 drain 模式被钉在一个 adjust tick（95ms ≈ 100ms tick），因为它每 tick 只轮询
-一次；Redis 的阻塞 `brpop` 是请求一落队列就推回来，不等 tick。并发也只有 Redis 有
-用：ZMQ 客户端整个请求周期持单 socket 锁（#186），4 并发和串行一样快。
-ZMQ 的用途是「这台机器没有 redis」。MySQL 仅作兜底。
+**地板是一个 adjust tick。** drain 下请求等下一拍拾取，串行调用锁相到整拍，所以 median
+≈ 100ms、min 是撞上拍边的运气；并发发请求（`call_async`）一拍最多处理 20 条，平均只等
+半拍。想再低只有缩 `schedule_adjust_interval`（需验证 `run_time` 是否认更小的值）或把
+serving 挪出 QMT 进程。读行情走 FormulaServer 直连 0.07ms，不经过这条链路。
+
+> 0.3.21–0.3.50 的 README 在这里写过「Redis ping 10ms / 交易查询 4ms / 195 次每秒」，那是
+> 在重启后的回放窗口里测的（见上一节），稳态下不存在。
 
 复现基准：
 ```powershell
@@ -1669,6 +1679,7 @@ python test_all_apis.py
 | `server_error: passorder submitted but order not found in system` | 委托没进系统。最常见是 QMT 模型交易的**运行模式是「模拟」**（默认值）—— `passorder` 内部撮合，永远到不了券商 | 运行模式改**实盘** |
 | `order_gateway is not configured` | 策略 `init` 挂了 | 看启动日志找真正的异常 |
 | `直接还款 (order_type 32): the repayment amount goes in order_volume as integer yuan, price is ignored` | 归还融资把金额放在了 `price`（#330）。`passorder` 的直接还款金额走 **volume 槽**，`price` 不看 | `order_stock(acc, code, CREDIT_DIRECT_CASH_REPAY, 还款金额, FIX_PRICE, 0, ...)`，金额整数元 |
+| `server_error: passorder submitted but order not found in system`（运行模式已是实盘） | **终端在下单前拦下了**——资金/仓位不足、价格越界、无权限。终端弹窗、不建委托记录、不发任何回调，这条回复是唯一信号（#345） | 看 QMT 屏幕上的弹窗；异步下单收 `on_order_error`（`source="settlement"`） |
 | `RequestExpired: ... NOT dispatched` / `TimeoutError: ... The bridge did NOT place this order` | **并发下单撞上串行 `passorder`**（每笔 ~200ms，在 QMT 策略线程上一笔一笔跑）：轮到这单时已过你的超时，桥**拒绝而没下**（#303） | 可安全重试；降并发或加大 `timeout_seconds`。超时后客户端会自动问 `get_request_outcome`，报错里写明下了没下 |
 
 **最常见的是第一条。** 一句话确认：

@@ -7,6 +7,112 @@
 
 ### 修复
 
+- **Redis 主机不通时，adjust 线程每拍在 LPOP 上卡满一个连接超时**。drain 模式下
+  adjust 每拍 LPOP 一次请求队列；主机宕机（不是拒绝，是没有应答）时这次 LPOP 要等满
+  `socket_connect_timeout`（1.5 s），下一拍再等一次。2026-09-17 12:53–16:25（192.168.8.13
+  不通）终端日志 `adjust cadence: ticks=7 avg=1.509s` 连续 1212 个窗口——策略自己的 `tick_app`
+  跟着从 100ms 一拍变 1.5 s 一拍，三个半小时。现在 LPOP 超时后 drain **暂停 5 s**，连续超时
+  翻倍到 30 s 封顶，第一次 LPOP 有应答就复位并记一行 `drain LPOP recovered`；暂停期间
+  `drain_request_queue` 立即返回 0，adjust 保持节奏。连接被拒绝（瞬时）仍照旧抛出。
+- **结算扫描进 `slow request` 日志**。`settle_pending_orders` 一次没命中回调快路径就扫一遍终端
+  委托列表，`drain_pending` 每拍最多三次；#345 之后每笔 `order_stock_async` 也盯 3 s，忙账户上
+  这是 adjust 线程唯一长出来的成本。超过 `slow_request_seconds` 记
+  `slow request method=settle_pending_orders[pending=N shadow=M] took X.Xs`；两个队列都空时
+  不计时、不扫描。
+
+### 文档
+
+- **延迟报告改正**（#351）。0.3.28 那张「redis + 后台线程 3.4ms / 交易查询 4ms / 195 次每秒」
+  是在**重启后的回放窗口**里测的：策略启动 QMT 先回放历史 K 线，adjust 跟着每根 K 线跑
+  （日志 `adjust cadence: ticks=51429 avg=0.000s over 10s`，每秒 5000 拍），那几十秒里任何
+  RPC 都是毫秒级；回放完 `run_time` 才是 10Hz，drain 一拍 ~100ms、后台线程每条命令一拍。
+  0.3.51 报告里「3.4ms 是 adjust 线程 LPOP 抢到的那部分、#321 关掉之后就没了」的解释是错的
+  ——9/14 起（#321 之前）后台线程回的包 `publish=` 就已经是 200–900ms。#321 真正改的是
+  0.3.46 前后台线程模式下 adjust 每拍那次 LPOP：它把后台线程等 GIL 时的请求拿到 adjust 上
+  一拍答完，体感是 ~100ms 与 500–900ms 混着来；关掉后全是 500–900ms（#351 的「变慢」），
+  drain 则全部一拍——配置里显式 `rpc_background_threads: True` 的改成 `False` 重启即可。
+  `LATENCY_REPORT.md` 方法论加「回放窗口」一条，README 撤下「10ms / 4ms / 195 次每秒」那张表
+  换成稳态四组合表，`BIG_QMT_REDIS_RPC.md` 的「100nMilliSecond 热循环 2150/s」同样是回放。
+
+## [0.3.52] - 2026-09-22
+
+#345 终端下单前拦下的单异步也有 `on_order_error`、pipe/mysql 无推送时异步单等结算；#330 直接还款无行不报错、信用委托 `order_type` 按 `m_nOpType`；#339 `download_history_data2` 的 `data_wait_seconds` 默认 60 → 10。
+
+### 修复
+
+- **`download_history_data2` 一批里有一只没数据就整批等 60 秒**（#339，@sotinyatgithub 的"每合约 12 秒"）。
+  `data_wait_seconds` 默认 60 → 10。实测（0.3.50，redis + drain）：服务端下载 0.6–1.4 s 同步返回后
+  20,726 根 1m 0.3 s 就能读到，第一次拉回为空的代码基本就是终端没有（停牌/新股/退市），等不来。
+  10 秒是几轮轮询的量。轮询里那次 `get_market_data_ex` 的 RPC 超时不再跟着这个值缩（取
+  `max(data_wait_seconds, 60)`），300 只 × 2 万根的一次回包不会被 10 秒截断。单合约 86 天 1m
+  整套 1.2–1.4 s，10 只一批 0.96 s/只——他报的 5–12 s 是 0.3.49 + `rpc_background_threads=True`
+  的账，同 #343。
+
+- **终端在下单前拦下的单（资金不足弹窗）异步下单收不到任何回调**（#345 @shyond，单文件 + 管道）。
+  这种拒绝发生在 `passorder` 之前，终端不建委托记录、不发回调；同步 `order_stock` 靠结算到期
+  查不到报 `server_error`，`order_stock_async`（`wait_settlement=False`）答完就没人管了。现在异步
+  单在回复之后仍挂一份**影子结算**，到期委托列表里没有就推 `order_error`（`source="settlement"`，
+  `error_msg` 是那条 not-found 说明），`on_order_error` 能收到；批量下单每一项各挂一份，回复不被
+  拖住。`not found in system` 的文案在运行模式之后补上「终端在建记录前拒绝：资金/仓位、价格、
+  权限，屏幕上有弹窗」。
+- **pipe / mysql 没有推送通道，回报一条都到不了**（同 #345）。之前 README 没写；这两种传输下客户端
+  `order_stock_async` 改为等服务端结算再回（worker 线程等，调用方不阻塞），`server_error` 走
+  `on_order_error`。README 传输段写明。
+- **部分归还融资成功却报 `order not found in system`**（#330 复测）。直接还款在委托列表里没有带
+  备注的行，结算到期查不到。现在 32/45 到期查不到不算失败：无编号、无 `server_error`，
+  `order_stock` 返回 -1 不抛，`message` 提示用 `query_credit_detail` 核对。
+- **`query_stock_orders` / `query_stock_trades` 把融资买入（27）报成 23**（#330）。`order_type`
+  此前从 BUY/SELL 反推。现在快照带终端的 `m_nOpType`，客户端按信用族反查 MiniQMT 常量：27-32 同号，
+  33/34 担保品买卖 → `CREDIT_BUY`/`CREDIT_SELL`（23/24），70-75 专项 → 40-45，80-83 转债透传；
+  没有 `op_type` 的旧服务端照旧。
+
+
+## [0.3.51] - 2026-09-22
+
+#343 / #342 的延迟：`rpc_background_threads` 默认改为 `False`（adjust drain，所有传输一律，实盘四种组合对照见 README「可插拔传输层」）；Redis 回包合成一次往返；超 1 秒的请求记 `slow request` 日志。**已有部署把配置里的 `True` 改成 `False` 后重启策略。**
+
+### 修复
+
+- **Redis 回包合成一次往返、只写一个客户端**（#343，@jiema）。`send_response` 原来对回包
+  依次做 SETEX + RPUSH + EXPIRE + PUBLISH，而且在响应客户端和监听客户端上**各做一遍**——
+  8 次往返。`rpc_background_threads=True` 时回包在后台监听线程上发，每次 Redis 命令放掉 GIL
+  再从 QMT 主线程手里抢回来约一个 adjust tick（#104），8 次就是半秒多。本机终端 0.3.50 实测：
+  `ping breakdown handle=0.0ms ... publish=500-700ms`，所有走监听线程的读请求端到端 0.5-0.8s，
+  而走 adjust 线程的 deferred 查询同一时刻 7ms。现在一条 pipeline 一次往返，第二个客户端只在
+  第一个抛错时兜底（两个客户端连的是同一个 Redis，之前的第二份写入是重复，不是冗余——回包
+  列表里还会多留一份到 TTL）。用终端自带的 redis-py 3.5.3 对着实盘 Redis 验证过 key / list /
+  channel 三处都到、列表恰好一项。**这只是把 8 次交接压成 1 次，不是回到 0.3.45 的 adjust
+  LPOP 抢队列（#321 关掉的那条路才是 3ms 那档），#343 的根因讨论在 issue 里。**
+  服务端改动，需部署 + 重启策略后实盘复测。
+- **单个请求把线程占住超过 1 秒时记一行 `slow request method=... took ...s thread=...`**（#342）。
+  `[adjust_phase] drain 2016488ms`（33 分钟）以及本机 2026-09-16 的 `drain 3540677ms`（59 分钟）
+  只记了阶段总耗时，没记是哪个请求把 adjust 线程冻住的。阈值 `slow_request_seconds` 默认 1.0，
+  在 handler 返回后才记，不给快请求加 GIL 等待。服务端改动，需部署后才生效。
+
+- **`rpc_background_threads` 默认改为 `False`（adjust drain），所有传输一律**（#343 @jiema、#342
+  @sotinyatgithub）。0.3.45 → 0.3.49 后 redis 上 RPC 从 0.1s 变 0.5–0.7s：#321 关掉了 adjust
+  线程每拍 LPOP 抢队列（它会把重读拖上策略线程），之后所有请求都走后台收包线程，而后台线程
+  每拿一次 GIL 就付一个 adjust tick，redis 回包 8 次往返就是 ~400ms。0.3.28 那张「redis +
+  后台线程 3.4ms 最快」的表测的其实是 adjust 抢到的那部分。2026-09-22 在实盘终端把四种组合各
+  重启一次、同一组探针各 20 轮（median，ms）：redis+后台 ping 407 / 持仓 197，zmq+后台
+  103 / 490，zmq+drain 87 / 88，redis+drain 102 / 103——**决定延迟的是线程模式不是传输**。
+  改动：`bigqmt-init` 对所有传输写 `False`；配置里不写这个键时，能 drain 的传输（redis /
+  zmq / pipe / mysql）默认 drain，只有没有 drain 实现的（shm）保留收包线程；显式 `True`
+  仍尊重。README「可插拔传输层」、`docs/LATENCY_REPORT.md` 换成这张四列表。**已有部署**：
+  `bigqmt_signal_trader_local_config.py` 里写着 `"rpc_background_threads": True` 的改成
+  `False` 后重启策略，这一处在顶层文件里热重载不生效。
+
+## [0.3.50] - 2026-09-21
+
+### 修复
+
+- **`connect()` 失败现在先拆掉事件监听再抛错**（@litaolemo）。`start()` 拉起的事件监听线程
+  持有 Redis pubsub 订阅（每实例 4 个 exec 事件频道），`connect()` 失败直接抛错时监听不拆、
+  实例被丢弃后订阅**永久留在服务端**——调用方重连风暴每次重试泄漏一个，实测单日 8000+ 个
+  subscribe 连接，逼近 maxclients 后整个 Redis 拒绝新连接。现在失败路径先 `stop()`（只拆线程
+  和排空异步单，不碰调用方的 redis 客户端）再抛原异常；失败后原地重试成功的话，监听由后续
+  `start()` / `subscribe()` 重新拉起。
+
 - **`download_history_data2`：服务端下载失败、客户端拉取又拉到 0 行时不再报 `{finished: total}`**（#339，@yucejade）。
   开了本地缓存时服务端下载一直是"尽力而为"——服务端本来就有的数据，后面的拉取能救回来。但拉取
   也拉到 0 行，就是什么都没下到，报满进度是 #47 那种假进度换了个分支。现在这种情况抛错，错误里
@@ -14,6 +120,16 @@
   照旧算完成。关本地缓存的路径（#47 起就抛）不变。#339 的另一半——服务端裸 RPC 恒 `False`、
   历史 tick / 1m 不落盘——在本机终端复现不出来（`download_history_data` 全局按代码逐个下，
   返回 `True`，tick / 1m 一秒内落盘），还在 issue 里追终端差异。
+- **`get_market_data_ex`：终端没有本地 K 线时用"前收盘填价"的垫行也触发自愈**（#339，@wolfeee，华泰终端 0.3.40）。
+  大 QMT 对没下过数据的窗口不返回空帧而是返回垫行，填法却因终端构建而异：国金终端填全 0
+  （既有 `_is_all_zero_any` 能认），华泰终端把前收填进 open/high/low/close——002594.SZ 1m
+  从 20260918 起要，答回来 150 根 **20260919（周六）** 的 84.3 平线、volume 0、suspendFlag 1。
+  价格非 0 就绕过了全 0 探测，自愈一直没起，调用方拿到一天假 K 线且没有任何提示。现在
+  两种构建共有的信号——**每根 volume 0 且 suspendFlag 1**——也触发服务端下载 + 重读；要求
+  *每个*代码都是垫行才算（组合里一只真停牌的票不能让整次读都付一次下载）；下载重读后仍是
+  垫行就打 warning 说明这不是成交。本机国金终端实测：001379.SZ 1m 裸 RPC 241 行全 0 →
+  客户端路径 241 根真 K 线（30 个不同收盘价，成交量 14638）；已有本地数据的票不受影响
+  （0.5s）。**华泰那种"前收填价"的形状本机复现不出来，只按报告人贴出的输出做了单元测试。**
 
 ## [0.3.49] - 2026-09-18
 
