@@ -304,6 +304,7 @@ BIGQMT_ACCOUNT_ID = "$Account"
 BIGQMT_ACCOUNT_TYPE = "$AccountType"
 
 BIGQMT_REDIS_CONFIG = {
+    "transport": "redis",
     "host": "127.0.0.1",
     "port": 6379,
     "db": 5,
@@ -312,7 +313,10 @@ BIGQMT_REDIS_CONFIG = {
     "rpc_allow_order_methods": $allowOrdersPy,
     "rpc_process_in_listener": True,
     "rpc_listener_methods": ("*",),
-    "rpc_background_threads": True,
+    # Redis uses the QMT adjust-thread drain in current releases. A background
+    # listener thread crosses the GIL several times per RPC and is slower in
+    # the steady-state terminal measurement (#343).
+    "rpc_background_threads": False,
     "schedule_adjust": True,
     "schedule_adjust_interval": "100nMilliSecond",
     "full_tick_cache_enabled": False,

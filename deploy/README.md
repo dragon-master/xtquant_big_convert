@@ -39,7 +39,7 @@ powershell -ExecutionPolicy Bypass -File .\deploy_qmt_bridge.ps1 `
 -SourceRepo "G:\Projects\xtquant_big_convert"
 ```
 
-`-AccountType` 必须与 QMT 模型交易中绑定的账号类型一致，例如普通股票账户是 `STOCK`，信用账户是 `CREDIT`，期货账户是 `FUTURE`。Redis 部署会生成 `rpc_background_threads=True`，这是该传输方式的低延迟配置。
+`-AccountType` 必须与 QMT 模型交易中绑定的账号类型一致，例如普通股票账户是 `STOCK`，信用账户是 `CREDIT`，期货账户是 `FUTURE`。Redis 部署会显式生成 `transport="redis"` 和 `rpc_background_threads=False`：由 QMT 的 `adjust` 线程 drain 请求；新版实测显示后台线程会因多次跨线程交接而更慢。
 
 **Redis 下载慢/中断**（GitHub Releases 国内直连不稳）三种出路，按速度排序：
 1. `-RedisZip "C:\path\Redis-x64-5.0.14.zip"` 离线传入（最快，一次拷贝终身用）
