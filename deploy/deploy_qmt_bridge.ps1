@@ -73,6 +73,37 @@ function Step($m) { Write-Host ""
 function Ok($m)   { Write-Host ("   [ok] " + $m) -ForegroundColor Green }
 function Info($m) { Write-Host ("   .. " + $m) }
 
+function Copy-DirectoryContents([string]$Source, [string]$Destination) {
+    <# Copy package contents into an existing package directory.
+
+    Copy-Item <source-dir> <existing-destination-dir> creates an extra child
+    named after <source-dir>. QMT then keeps importing the old top-level
+    package, while the update sits unused one directory too deep. Copy every
+    file to its explicit relative destination instead. Python bytecode belongs
+    to the development interpreter, never to QMT's embedded Python 3.6.
+    #>
+    if (-not (Test-Path -LiteralPath $Source -PathType Container)) {
+        throw "package source directory not found: $Source"
+    }
+    New-Item -ItemType Directory -Force -Path $Destination | Out-Null
+    $sourceRoot = (Resolve-Path -LiteralPath $Source).Path
+    Get-ChildItem -LiteralPath $sourceRoot -Recurse -Force -File |
+        Where-Object {
+            $_.FullName -notmatch '[\\/]__pycache__[\\/]' -and
+            $_.Extension -ne '.pyc'
+        } |
+        ForEach-Object {
+            $relative = $_.FullName.Substring($sourceRoot.Length).TrimStart(
+                [char[]]@([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar))
+            $target = Join-Path $Destination $relative
+            $parent = Split-Path -Parent $target
+            if (-not (Test-Path -LiteralPath $parent)) {
+                New-Item -ItemType Directory -Force -Path $parent | Out-Null
+            }
+            Copy-Item -LiteralPath $_.FullName -Destination $target -Force
+        }
+}
+
 # ---- 0. preconditions -----------------------------------------------------
 Step "0/7 preconditions"
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
@@ -211,11 +242,17 @@ if ($sourceRepoPath) {
         throw "client Python resolved bridge files outside SourceRepo: $src"
     }
 }
-foreach ($item in @("bigqmt_signal_trader","bigqmt_signal_trader_strategy.py",
+Copy-DirectoryContents (Join-Path $src "bigqmt_signal_trader") `
+    (Join-Path $dst "bigqmt_signal_trader")
+foreach ($item in @("bigqmt_signal_trader_strategy.py",
                     "bigqmt_signal_trader_redis_rpc_runtime.py","BIGQMT_REDIS_DRYRUN.py")) {
-    Copy-Item (Join-Path $src $item) (Join-Path $dst $item) -Recurse -Force
+    $sourceFile = Join-Path $src $item
+    if (-not (Test-Path -LiteralPath $sourceFile -PathType Leaf)) {
+        throw "bridge source file not found: $sourceFile"
+    }
+    Copy-Item -LiteralPath $sourceFile -Destination (Join-Path $dst $item) -Force
 }
-Ok "copied to $dst"
+Ok "copied package contents and 3 entry files to $dst"
 
 # ---- 3. redis download / unzip --------------------------------------------
 Step "3/7 redis 5.0.14"
