@@ -573,29 +573,41 @@ xt_trader.reload_status()            # -> {'ok': True, 'modules_purged': 28,
 
 ### 可插拔传输层
 
-**决定延迟的是线程模式，不是传输。** 2026-09-22 在同一台实盘终端（0.3.50，
-`schedule_adjust_interval: "100nMilliSecond"`）把四种组合各重启一次、同一组只读探针各
-跑 20 轮，min / median / max（ms）：
+**决定延迟的是线程模式，不是传输。** 2026-09-22 在同一台实盘终端（0.3.53，
+`schedule_adjust_interval: "100nMilliSecond"`）把四种组合各重启一次，**等日志 cadence 回到
+`ticks≈100`**（回放窗口结束）再测，同一组只读探针各跑 20 轮、**轮间隔随机抖动**，
+min / **median** / max（ms）：
 
-| 方法 | redis + 后台线程 | zmq + 后台线程 | zmq + drain | redis + drain |
+| 方法 | redis + drain | zmq + drain | redis + 后台线程 | zmq + 后台线程 |
 |---|---|---|---|---|
-| ping | 199 / 407 / 605 | 98 / 103 / 303 | 10 / 87 / 108 | 23 / 102 / 106 |
-| get_full_tick（1 只） | 199 / 338 / 473 | 8 / 196 / 306 | 8 / 90 / 107 | 26 / 102 / 107 |
-| get_instrument_detail | 132 / 208 / 373 | 99 / 195 / 211 | 7 / 88 / 104 | 33 / 102 / 107 |
-| query_stock_positions | 102 / 197 / 320 | 396 / 490 / 600 | 8 / 88 / 103 | 85 / 103 / 109 |
-| query_stock_orders | 33 / 175 / 200 | 399 / 493 / 613 | 4 / 88 / 105 | 86 / 102 / 109 |
+| ping | 16 / **41** / 99 | 8 / **42** / 98 | 7 / **36** / 106 | 5 / **150** / 285 |
+| get_full_tick（1 只） | 21 / **73** / 118 | 4 / **48** / 102 | 6 / **37** / 93 | 109 / **149** / 198 |
+| get_instrument_detail | 25 / **55** / 115 | 5 / **52** / 100 | 9 / **47** / 88 | 84 / **149** / 270 |
+| get_market_data_ex（1d×5）| 22 / **75** / 118 | 10 / **72** / 113 | 7 / **50** / 110 | 108 / **147** / 290 |
+| **query_stock_positions** | 20 / **70** / 121 | 5 / **51** / 97 | 74 / **143** / 199 | 218 / **456** / 573 |
+| **query_stock_orders** | 27 / **83** / 122 | 2 / **35** / 93 | 105 / **157** / 198 | 168 / **444** / 568 |
+| get_full_tick（"SH" 令牌）| 149 / **203** / 268 | 203 / **231** / 294 | 168 / **297** / 429 | 623 / **713** / 1536 |
+| get_market_data_ex（1m 三周窗口）| 58 / **113** / 166 | 32 / **68** / 160 | 39 / **165** / 278 | 123 / **370** / 474 |
 
-- **drain**（`rpc_background_threads: False`）：adjust 线程自己收 / 处理 / 发，一个请求最多等
-  一个 tick，`handle` 0–1ms、`return` 1–5ms，所以 max 卡在 ~105ms
-- **后台线程**（`True`）：收包线程每拿一次 GIL 就付约一个 tick。往返次数决定延迟——
-  redis 回包 8 次往返 ≈ 400ms；zmq 的 ping 1–2 次 ≈ 100–200ms；zmq 上走 adjust 的交易查询
-  收→丢队列→adjust 处理→回 router 线程发，4–5 次 ≈ 500ms
+- **drain**（`rpc_background_threads: False`）：adjust 线程自己收 / 处理 / 发，分布是
+  **0–1 拍均匀、中位约半拍**（35–85ms），max 封在一拍多一点。redis 和 zmq 没有可感知差别。
+- **后台线程**（`True`）：收包线程每拿一次 GIL 就付约一个 tick。redis 的只读已被 #344
+  （回包合成一次 pipeline）追平到 36–50ms，但**交易查询仍多一拍**（143–157ms），重读也
+  更贵（后台线程模式下没有重读工作线程）。**zmq + 后台线程是唯一该避开的**：交易查询
+  约 5 拍（444–456ms），全市场快照 713ms。
+- **重读走工作线程**（0.3.53）：读本身短的（1m 窗口，12–19ms）在同一拍内就答完，不额外
+  付拍；只有读本身超过一拍的（全市场快照）才溢出到下一拍。
+
+> 自己复测请注意两件事，都是踩过的坑：**等 cadence 回到 `ticks≈100` 再测**（重启后的回放
+> 窗口里 adjust 每秒几千拍，什么都是毫秒级），**轮间隔要随机抖动**（固定 0.3s 正好是 3 拍，
+> 会把每一轮锁死在同一相位，中位数变成第一次调用撞上什么相位的产物）。详见
+> [docs/LATENCY_REPORT.md](docs/LATENCY_REPORT.md) 的方法论。
 
 所以 **`rpc_background_threads` 一律 `False`**，redis 也是。0.3.28 那张「redis + 后台线程
 3.4ms 最快」的表是真的测出来的，但测在**重启后的回放窗口**里：策略一启动 QMT 先回放历史
 K 线，adjust 跟着每根 K 线跑（日志 `adjust cadence: ticks=51429 ... over 10s`，每秒 5000 拍），
-那几十秒里什么 RPC 都是毫秒级；回放完 `run_time` 才是 10Hz，drain 一拍 ~100ms、后台线程
-每条命令一拍。稳态下 redis + 后台线程是四种里最慢的（#343 的报告就是这个）。0.3.46 及之前
+那几十秒里什么 RPC 都是毫秒级；回放完 `run_time` 才是 10Hz。稳态下只读两种模式同档，
+交易查询 drain 稳赢一拍（上表）。0.3.46 及之前
 后台线程模式下 adjust 每拍还会 LPOP 一次，后台线程忙着等 GIL 时请求被 adjust 拿走一拍答完，
 所以体感是 ~100ms 和 500–900ms 混着来；#321 关掉那次 LPOP 后全是 500–900ms（#351 说的
 「变慢」就是这个），drain 则是全部一拍。`bigqmt-init` 从 0.3.51 起对所有传输都写 `False`；
@@ -963,6 +975,34 @@ BIGQMT_REDIS_CONFIG = {
 - **全推行情推送到每个账号**（#315 起）。推送通道按账号命名（`bigqmt:quote_push:<账号>:<topic>`），此前只发主账号的频道，按副账号配置的客户端「订阅成功但无回调」。现在表里每个账号各发一份，客户端不用改。
 - **已实盘验证**：上面这份配置的形状就是一套实际跑着的 STOCK + FUTURE 部署，dual-channel 收发、副账号的 `account_id` 注入、副账号交易请求被主线程 drain 三条路都在实盘走通了。#171 合并时 CHANGELOG 写的"本仓库从未实跑过"已经不再成立。换券商或换账号类型组合时，仍建议先用小单验一遍副账号的下单、撤单、持仓。
 
+#### 同一个账号、几种类型：港股通（`BIGQMT_ACCOUNT_TYPE` 写成列表）
+
+港股通不是另一个账号：股票户用**同一个资金账号**做沪港通 / 深港通，但终端把那些持仓、委托、
+成交记在 `get_trade_detail_data(账号, 'HUGANGTONG' | 'SHENGANGTONG', ...)` 下，按 `'STOCK'`
+查不到。`BIGQMT_ACCOUNT_TYPE_MAP` 一个账号只能对一个类型，写不出这件事——所以类型可以是**列表**，
+第一个是默认（0.3.54 起）：
+
+```python
+BIGQMT_ACCOUNT_ID = "你的股票账号"
+BIGQMT_ACCOUNT_TYPE = ["STOCK", "HUGANGTONG", "SHENGANGTONG"]   # 方式一的表里也可以：{"账号": ["STOCK", "HUGANGTONG"]}
+```
+
+客户端照 MiniQMT 的写法，用类型不同的 `StockAccount` 分别查：
+
+```python
+acc    = StockAccount("你的股票账号")                  # A 股
+acc_hk = StockAccount("你的股票账号", "SHENGANGTONG")  # 深港通（沪港通用 "HUGANGTONG"）
+xt_trader.query_stock_positions(acc)      # STOCK 持仓
+xt_trader.query_stock_positions(acc_hk)   # 深港通持仓
+xt_trader.order_stock(acc_hk, "00700.HK", xtconstant.STOCK_BUY, 100, xtconstant.FIX_PRICE, 300.0)
+```
+
+`StockAccount` 的类型随每个交易类请求以 `account_type` 参数传到服务端；在列表里就按它查、按它结算
+（港股通委托的合同编号回填要去 HUGANGTONG 的委托列表里找），不在列表里仍按默认答并记一次日志——部署
+的配置仍然决定这个账号是什么户（#92 那条不变）。`ping` 多报 `account_types`，客户端的「类型不一致」
+告警只在声明的类型不在这张表里时才响。下单本身不用改：`passorder` 的 23/24 对 `.HK` 代码就是港股通
+买卖。撤单也带类型。**没有港股通权限或不用列表的部署，行为零变化。**
+
 #### 方式二：多策略实例（账号在不同 QMT 客户端时的唯一选择）
 
 **适用条件：每个账号登录在各自的 QMT 客户端里**（不同券商、不同机器，或同一台机器上两个安装目录）。每个客户端是一个独立进程，各自有自己的 `python` 目录，所以什么都不用"指向"——每个目录里放一份**同名**的配置文件和一份入口，各写各的账号：
@@ -1062,7 +1102,7 @@ xt_trader.cancel_order_stock(acc, order_id)   # 撤单送回的是原始字符�
 | `get_full_tick(["SH"])` | 全市场 | **默认只取股票**（1.08s）；要全部传 `types=["all"]`（7.4s，含地方债等 26744 只） |
 | `get_instrument_detail()` 查不到 | `None` | `{}`（两者都是 falsy，`if not detail` 通用） |
 | `download_history_data()` | 无返回 | 返回 `{"finished": n, "total": n}`（多给的信息，可忽略） |
-| 账户类型 | `StockAccount(id, "CREDIT")` 即可 | 还需服务端 `BIGQMT_ACCOUNT_TYPE = "CREDIT"`，**客户端的类型不会传到服务端** |
+| 账户类型 | `StockAccount(id, "CREDIT")` 即可 | 服务端 `BIGQMT_ACCOUNT_TYPE` 决定；客户端的类型会随请求传来，但只在服务端配置（可以是列表，港股通）允许时才生效 |
 | 委托类型常量 | `xtconstant.order_type` | 内部会翻译成 `passorder` 的 opType（两套编号，专项两融 40–45 → 70–75） |
 
 ### 本项目的扩展（MiniQMT 没有）
