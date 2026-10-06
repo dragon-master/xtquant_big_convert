@@ -530,6 +530,10 @@ class RawFieldSnapshotTest(unittest.TestCase):
 class ExecEventsClientDispatchTest(unittest.TestCase):
     def _trader(self):
         trader = BigQmtXtTrader(account_id="acct")
+        # subscribe() starts a daemon listener.  This class includes a
+        # lifecycle test, so every trader it creates must be stopped before
+        # the next test can capture this module's logger.
+        self.addCleanup(trader.stop)
         cb = RecordingCallback()
         trader.register_callback(cb)
         return trader, cb

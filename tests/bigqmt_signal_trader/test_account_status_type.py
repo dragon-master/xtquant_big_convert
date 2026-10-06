@@ -68,23 +68,32 @@ def _trader(server_type="CREDIT"):
     return trader, recorder
 
 
-class ReportsTheServerTypeTest(unittest.TestCase):
+class _TraderLifecycleTest(unittest.TestCase):
+    """Own the event-listener threads started by ``subscribe`` in this file."""
+
+    def _make_trader(self, server_type="CREDIT"):
+        trader, recorder = _trader(server_type)
+        self.addCleanup(trader.stop)
+        return trader, recorder
+
+
+class ReportsTheServerTypeTest(_TraderLifecycleTest):
     def test_a_credit_deployment_reports_credit(self):
-        trader, recorder = _trader("CREDIT")
+        trader, recorder = self._make_trader("CREDIT")
 
         trader.connect()
 
         self.assertEqual(recorder.statuses[-1].account_type, "CREDIT")
 
     def test_a_stock_deployment_reports_stock(self):
-        trader, recorder = _trader("STOCK")
+        trader, recorder = self._make_trader("STOCK")
 
         trader.connect()
 
         self.assertEqual(recorder.statuses[-1].account_type, "STOCK")
 
     def test_the_account_id_still_rides_along(self):
-        trader, recorder = _trader("CREDIT")
+        trader, recorder = self._make_trader("CREDIT")
 
         trader.connect()
 
@@ -92,18 +101,18 @@ class ReportsTheServerTypeTest(unittest.TestCase):
         self.assertEqual(recorder.statuses[-1].status, 1)
 
 
-class FallbackTest(unittest.TestCase):
+class FallbackTest(_TraderLifecycleTest):
     """An older deployment does not report the field at all."""
 
     def test_it_falls_back_to_what_the_caller_declared(self):
-        trader, recorder = _trader(server_type=None)
+        trader, recorder = self._make_trader(server_type=None)
 
         trader.subscribe(StockAccount(ACCOUNT, "CREDIT"))
 
         self.assertEqual(recorder.statuses[-1].account_type, "CREDIT")
 
     def test_with_neither_it_stays_stock(self):
-        trader, recorder = _trader(server_type=None)
+        trader, recorder = self._make_trader(server_type=None)
 
         trader.subscribe(StockAccount(ACCOUNT))
 
@@ -111,7 +120,7 @@ class FallbackTest(unittest.TestCase):
 
     def test_the_server_wins_over_the_declaration(self):
         """The client's type never reaches QMT, so the server is the truth."""
-        trader, recorder = _trader("STOCK")
+        trader, recorder = self._make_trader("STOCK")
         trader.connect()
 
         trader.subscribe(StockAccount(ACCOUNT, "CREDIT"))
@@ -119,11 +128,11 @@ class FallbackTest(unittest.TestCase):
         self.assertEqual(recorder.statuses[-1].account_type, "STOCK")
 
 
-class MismatchIsAnnouncedTest(unittest.TestCase):
+class MismatchIsAnnouncedTest(_TraderLifecycleTest):
     """Silence here is what made #92 expensive to diagnose."""
 
     def test_a_disagreement_warns(self):
-        trader, _recorder = _trader("STOCK")
+        trader, _recorder = self._make_trader("STOCK")
         trader.connect()
 
         with self.assertLogs(compat.log, level="WARNING") as logs:
@@ -133,7 +142,7 @@ class MismatchIsAnnouncedTest(unittest.TestCase):
         self.assertIn("account_type mismatch", joined)
 
     def test_the_warning_says_where_to_fix_it(self):
-        trader, _recorder = _trader("STOCK")
+        trader, _recorder = self._make_trader("STOCK")
         trader.connect()
 
         with self.assertLogs(compat.log, level="WARNING") as logs:
@@ -145,7 +154,7 @@ class MismatchIsAnnouncedTest(unittest.TestCase):
 
     def test_the_warning_names_the_symptom(self):
         """"all-zero asset row" is what the reporter actually saw."""
-        trader, _recorder = _trader("STOCK")
+        trader, _recorder = self._make_trader("STOCK")
         trader.connect()
 
         with self.assertLogs(compat.log, level="WARNING") as logs:
@@ -154,7 +163,7 @@ class MismatchIsAnnouncedTest(unittest.TestCase):
         self.assertIn("all-zero", "\n".join(logs.output))
 
     def test_agreement_is_quiet(self):
-        trader, _recorder = _trader("CREDIT")
+        trader, _recorder = self._make_trader("CREDIT")
         trader.connect()
 
         logger = logging.getLogger(compat.log.name)
@@ -166,7 +175,7 @@ class MismatchIsAnnouncedTest(unittest.TestCase):
 
     def test_a_silent_deployment_does_not_warn(self):
         """No reported type means nothing to disagree with."""
-        trader, _recorder = _trader(server_type=None)
+        trader, _recorder = self._make_trader(server_type=None)
         trader.connect()
 
         logger = logging.getLogger(compat.log.name)
