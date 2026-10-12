@@ -354,6 +354,8 @@ BIGQMT_REDIS_CONFIG = {
     # listener thread crosses the GIL several times per RPC and is slower in
     # the steady-state terminal measurement (#343).
     "rpc_background_threads": False,
+    # Full QMT-only deployment: no MiniQMT quote service to connect to.
+    "native_xtdata_enabled": False,
     "schedule_adjust": True,
     "schedule_adjust_interval": "100nMilliSecond",
     "full_tick_cache_enabled": False,

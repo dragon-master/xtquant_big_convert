@@ -41,6 +41,10 @@ powershell -ExecutionPolicy Bypass -File .\deploy_qmt_bridge.ps1 `
 
 `-AccountType` 必须与 QMT 模型交易中绑定的账号类型一致，例如普通股票账户是 `STOCK`，信用账户是 `CREDIT`，期货账户是 `FUTURE`。Redis 部署会显式生成 `transport="redis"` 和 `rpc_background_threads=False`：由 QMT 的 `adjust` 线程 drain 请求；新版实测显示后台线程会因多次跨线程交接而更慢。
 
+本部署方案只使用完整 QMT，因此生成的服务端配置显式设置 `native_xtdata_enabled=False`，跳过对 MiniQMT 行情服务的连接尝试。行情快照、合约资料等有 QMT 内置接口可用的查询继续使用这些接口；仅依赖原生 SDK 且没有内置替代的接口会明确报不可用。以后若同机运行已登录的 MiniQMT 并需要其接口，可按需启用该配置；重新运行本部署脚本仍会恢复为 `False`。
+
+修改 `bigqmt_signal_trader_local_config.py` 后需要重启桥接策略。`reload_deployment` 只重新加载包内代码，不会重新读取入口已加载的私有配置。
+
 **Redis 下载慢/中断**（GitHub Releases 国内直连不稳）三种出路，按速度排序：
 1. `-RedisZip "C:\path\Redis-x64-5.0.14.zip"` 离线传入（最快，一次拷贝终身用）
 2. `-RedisUrl "https://<镜像>/...zip"` 自定义下载源（公共 gh 加速时快时慢，建议实测后固定）
