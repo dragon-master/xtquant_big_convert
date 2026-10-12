@@ -578,6 +578,15 @@ def _build_app(context_info):
     return _default_build_app(context_info, _build_config())
 
 
+def _build_market_data_provider(context_info, config):
+    """Use the shared factory so RPC and downloads honor the SDK gate too."""
+    if _load_bridge_module is not None:
+        factory = _load_bridge_module("bigqmt_signal_trader.adapter_factory")
+    else:
+        from bigqmt_signal_trader import adapter_factory as factory
+    return factory.build_bigqmt_market_data_provider(context_info, config)
+
+
 def _config_bool(value, default=False):
     if value is None:
         return default
@@ -711,7 +720,6 @@ def _build_rpc_service(context_info, app, config):
             importlib.reload(importlib.import_module(_mod_name))
         except Exception as _reload_err:
             print("[bigqmt_rpc] reload %s failed: %s" % (_mod_name, _reload_err))
-    BigQmtMarketDataProvider = _market_bigqmt.BigQmtMarketDataProvider
     BigQmtPositionProvider = _position_bigqmt.BigQmtPositionProvider
 
     qmt_api = dict(config.get("qmt_api") or {})
@@ -753,7 +761,7 @@ def _build_rpc_service(context_info, app, config):
     )
     handlers = BigQmtRpcHandlers(
         account_id=account_id,
-        market_data=BigQmtMarketDataProvider(context_info, qmt_api=qmt_api),
+        market_data=_build_market_data_provider(context_info, config),
         position_provider=BigQmtPositionProvider(
             get_trade_detail_data_func=qmt_api.get("get_trade_detail_data"),
             account_type=config.get("account_type", "STOCK"),
@@ -1475,9 +1483,7 @@ def _pump_download_jobs(context_info, config):
         return None
     market_data = getattr(getattr(_rpc_service, "handlers", None), "market_data", None)
     if market_data is None:
-        from bigqmt_signal_trader.adapters.market_bigqmt import BigQmtMarketDataProvider
-
-        market_data = BigQmtMarketDataProvider(context_info, qmt_api=dict(config.get("qmt_api") or {}))
+        market_data = _build_market_data_provider(context_info, config)
     try:
         from bigqmt_signal_trader.download_jobs import pump_download_jobs
 

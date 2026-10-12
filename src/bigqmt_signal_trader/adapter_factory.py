@@ -60,6 +60,27 @@ def _config_bool(value, default=False):
     return str(value).strip().lower() in ("1", "true", "yes", "y", "on")
 
 
+def build_bigqmt_market_data_provider(context_info, config=None):
+    """Build the application/RPC/download provider with the same SDK gate.
+
+    Native SDK calls connect to the MiniQMT quote service. Keep pipe's
+    historical default off, other transports on, and honor an explicit
+    native_xtdata_enabled value at every construction site.
+    """
+    from .adapters.market_bigqmt import BigQmtMarketDataProvider
+
+    config = config or {}
+    rpc_config = dict(config.get("rpc") or {})
+    native_enabled = rpc_config.get("native_xtdata_enabled")
+    if native_enabled is None:
+        native_enabled = str(rpc_config.get("transport") or "redis").lower() != "pipe"
+    return BigQmtMarketDataProvider(
+        context_info,
+        qmt_api=config.get("qmt_api") or {},
+        native_xtdata_enabled=bool(native_enabled),
+    )
+
+
 def build_app(context_info=None, config=None):
     config = config or {}
     mode = str(config.get("mode") or "dryrun").lower()
@@ -119,21 +140,12 @@ def build_app(context_info=None, config=None):
         )
 
     if mode == "bigqmt":
-        from .adapters.market_bigqmt import BigQmtMarketDataProvider
         from .adapters.order_bigqmt import BigQmtOrderGateway
         from .adapters.position_bigqmt import BigQmtPositionProvider
 
         qmt_api = config.get("qmt_api") or {}
         get_trade_detail_data_func = qmt_api.get("get_trade_detail_data")
-        # native xtdata SDK 的调用会拨本地行情服务（58610）——pipe 这类
-        # 「外连即杀」的沙箱部署一次 SDK 调用就死，默认关掉（2026-09-24
-        # 实盘逐行核对发现）。
-        _rpc_cfg = dict(config.get("rpc") or {})
-        _native_enabled = _rpc_cfg.get("native_xtdata_enabled")
-        if _native_enabled is None:
-            _native_enabled = str(_rpc_cfg.get("transport") or "redis").lower() != "pipe"
-        market_data = market_data or BigQmtMarketDataProvider(
-            context_info, qmt_api=qmt_api, native_xtdata_enabled=bool(_native_enabled))
+        market_data = market_data or build_bigqmt_market_data_provider(context_info, config)
         position_provider = position_provider or BigQmtPositionProvider(
             get_trade_detail_data_func=get_trade_detail_data_func,
             account_type=config.get("account_type", "STOCK"),
