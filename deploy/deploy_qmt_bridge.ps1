@@ -14,6 +14,7 @@
 .PARAMETER RedisZip Offline redis zip path; skip GitHub download when provided
 .PARAMETER Proxy    HTTP proxy for downloads, e.g. http://127.0.0.1:7897
 .PARAMETER AllowOrders  Enable order RPCs in the generated server config (off by default)
+.PARAMETER PreserveConfig  Keep existing server/client private configs unchanged during an upgrade
 #>
 param(
     [Parameter(Mandatory=$true)][string]$QmtDir,
@@ -27,6 +28,7 @@ param(
     [string]$Proxy = "",
     [switch]$CheckOnly,
     [switch]$AllowOrders,
+    [switch]$PreserveConfig,
     [switch]$Conda,
     [string]$MinicondaUrl = "",
     [string]$PipIndex = "https://pypi.tuna.tsinghua.edu.cn/simple",
@@ -72,6 +74,23 @@ function Step($m) { Write-Host ""
   Write-Host ("== " + $m) -ForegroundColor Cyan }
 function Ok($m)   { Write-Host ("   [ok] " + $m) -ForegroundColor Green }
 function Info($m) { Write-Host ("   .. " + $m) }
+
+function Write-DeploymentConfig([string]$Path, [string]$Content, [switch]$PreserveExisting) {
+    # Configs belong to the operator, not the package. During upgrades keep
+    # account maps, credentials, and custom settings byte-for-byte intact.
+    if (Test-Path -LiteralPath $Path) {
+        if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+            throw "private config path is not a file: $Path"
+        }
+        if ($PreserveExisting) {
+            Info "preserved existing private config: $Path"
+            return $false
+        }
+    }
+    Set-Content -LiteralPath $Path -Value $Content -Encoding UTF8
+    Ok $Path
+    return $true
+}
 
 function Copy-DirectoryContents([string]$Source, [string]$Destination) {
     <# Copy package contents into an existing package directory.
@@ -364,8 +383,9 @@ BIGQMT_REDIS_CONFIG = {
     "exec_events_debug_raw_fields": False,
 }
 "@
-Set-Content "$dst\bigqmt_signal_trader_local_config.py" $localCfg -Encoding UTF8
-Ok "$dst\bigqmt_signal_trader_local_config.py"
+$serverConfigWritten = Write-DeploymentConfig `
+    -Path "$dst\bigqmt_signal_trader_local_config.py" `
+    -Content $localCfg -PreserveExisting:$PreserveConfig
 
 # ---- 6. client config + CLI ------------------------------------------------
 Step "6/7 client config + CLI"
@@ -398,7 +418,9 @@ BIGQMT_LOCAL_CACHE_CONFIG = {
     "format": "auto",
 }
 "@
-Set-Content "$cdir\bigqmt_signal_trader_client_config.py" $clientCfg -Encoding UTF8
+$null = Write-DeploymentConfig `
+    -Path "$cdir\bigqmt_signal_trader_client_config.py" `
+    -Content $clientCfg -PreserveExisting:$PreserveConfig
 Ok "client config + qmt_cli.py in $cdir"
 
 # ---- 7. optional: strategy folder -----------------------------------------
@@ -423,7 +445,9 @@ Write-Host @"
 3. redis password saved at: $pwFile
 4. Memory budget on 2C4G: QMT ~1.5G + redis <=192M + python ~400M. Close QMT panels you do not use.
 "@ -ForegroundColor Yellow
-if ($AllowOrders) {
+if (-not $serverConfigWritten) {
+    Write-Host "5. existing order permission was preserved. -AllowOrders only affects newly written configs. After restarting the strategy, check allow_order_methods in the read-only ping reply." -ForegroundColor Yellow
+} elseif ($AllowOrders) {
     Write-Host "5. order RPCs: ENABLED (-AllowOrders). buy/sell/cancel will work." -ForegroundColor Yellow
 } else {
     Write-Host "5. order RPCs: OFF (default). buy/sell/cancel answer ORDER_DISABLED; re-run with -AllowOrders or set rpc_allow_order_methods=True in $dst\bigqmt_signal_trader_local_config.py and restart the strategy." -ForegroundColor Yellow

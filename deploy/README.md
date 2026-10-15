@@ -45,6 +45,17 @@ powershell -ExecutionPolicy Bypass -File .\deploy_qmt_bridge.ps1 `
 
 修改 `bigqmt_signal_trader_local_config.py` 后需要重启桥接策略。`reload_deployment` 只重新加载包内代码，不会重新读取入口已加载的私有配置。
 
+### 升级已有部署：保留私有配置
+
+升级时加 `-PreserveConfig`：继续更新服务端代码和 `qmt_cli.py`，但不覆盖已有的服务端、客户端配置文件。普通／信用账户映射 `BIGQMT_ACCOUNT_TYPE_MAP`、Redis 密码、下单权限及手工设置的其他参数都会原样保留；缺少的配置文件仍按部署参数生成。该选项不会自动给旧配置补上新版字段，需要按升级说明另行核查。
+
+```powershell
+# 加到上面的一键部署命令中；以下只展示升级选项，不是完整命令。
+-PreserveConfig -AllowOrders
+```
+
+`-AllowOrders` 只决定本次新写配置的下单权限。使用 `-PreserveConfig` 且服务端配置已经存在时，以原文件的权限为准，不会因命令参数而修改。重启后使用只读 `ping` 返回的 `allow_order_methods` 核对实际权限。不要把含真实账号和密码的配置提交到 Git。
+
 **Redis 下载慢/中断**（GitHub Releases 国内直连不稳）三种出路，按速度排序：
 1. `-RedisZip "C:\path\Redis-x64-5.0.14.zip"` 离线传入（最快，一次拷贝终身用）
 2. `-RedisUrl "https://<镜像>/...zip"` 自定义下载源（公共 gh 加速时快时慢，建议实测后固定）
