@@ -8,6 +8,8 @@
 
 已发布 PyPI，客户端一行安装：`pip install xtquant-big-convert`（详见下文「环境要求与依赖安装」）。
 
+外部策略、固定数量轮动与组合管理的接入设计，见[外部策略轮动模板](EXTERNAL_STRATEGY_ROTATION_TEMPLATE.md)，附可离线运行的调仓计算示例。
+
 另附 [qmt-trader skill](../qmt-trader/)：让 Claude Code / ZCode / Cursor 等 AI 助手通过统一 CLI（47 个子命令）直接查行情、算期权 Greeks、查持仓、下单撤单，详见下文「AI 助手 Skill：qmt-trader」。
 
 ---
