@@ -383,6 +383,21 @@ def _perform_reload(context_info):
         if identity_journal:
             new_handlers = getattr(_rpc_service, "handlers", None)
             if new_handlers is not None:
+                # init may have recovered entries written by another process.
+                # Keep those too, together with old memory-only entries whose
+                # disk write failed. A valid first name still owns its remark.
+                recovered = getattr(new_handlers, "_order_identity_local", None) or {}
+                now = time.time()
+                ttl = getattr(new_handlers, "_ORDER_IDENTITY_LOCAL_TTL_SECONDS", 7 * 86400)
+                for key, entry in recovered.items():
+                    old_entry = identity_journal.get(key)
+                    if (old_entry is None or now - old_entry[0] > ttl
+                            or (entry[1] and not old_entry[1])
+                            or (entry[1] == old_entry[1] and entry[0] > old_entry[0])):
+                        identity_journal[key] = entry
+                limit = getattr(new_handlers, "_ORDER_IDENTITY_LOCAL_LIMIT", 5000)
+                while len(identity_journal) > limit:
+                    identity_journal.popitem(last=False)
                 new_handlers._order_identity_local = identity_journal
                 print("[bigqmt_reload] order identity journal carried across "
                       "(%d entries)" % len(identity_journal))
@@ -673,6 +688,11 @@ def _build_quote_subscription_service(context_info, config, transport_name, acco
     _qsm = importlib.reload(_qsm)
     heartbeat_timeout = float(quote_config.get("heartbeat_timeout_seconds", 30.0))
     zmq_bind_address = quote_config.get("zmq_bind_address")
+    # #408: the events pipe derives its name from the RPC pipe block so both
+    # sides compute the same path from the same config.
+    pipe_name = dict(config.get("rpc") or {}).get("pipe", {}).get("pipe_name")
+    if pipe_name is None:
+        pipe_name = dict(config.get("pipe") or {}).get("pipe_name")
     return _qsm.build_quote_subscription_service(
         context_info,
         transport_name=transport_name,
@@ -681,10 +701,12 @@ def _build_quote_subscription_service(context_info, config, transport_name, acco
         zmq_bind_address=zmq_bind_address,
         enabled=True,
         heartbeat_timeout_seconds=heartbeat_timeout,
+        pipe_name=pipe_name,
     )
 
 
 def _build_rpc_service(context_info, app, config):
+    global _exec_events
     rpc_config = dict(config.get("rpc") or {})
     enabled = _config_bool(config.get("enable_rpc"), False) or _config_bool(rpc_config.get("enabled"), False)
     if not enabled:
@@ -702,7 +724,9 @@ def _build_rpc_service(context_info, app, config):
     else:
         from bigqmt_signal_trader.adapters import market_bigqmt as _market_bigqmt
         from bigqmt_signal_trader.adapters import position_bigqmt as _position_bigqmt
-        from bigqmt_signal_trader.redis_rpc import BigQmtRpcHandlers, RedisPubSubRpcService
+        from bigqmt_signal_trader import redis_rpc as _redis_rpc
+        BigQmtRpcHandlers = _redis_rpc.BigQmtRpcHandlers
+        RedisPubSubRpcService = _redis_rpc.RedisPubSubRpcService
 
     # QMT keeps strategy modules in the same process between editor reruns.
     # Reload adapters here so synced local package fixes take effect immediately.
@@ -714,12 +738,17 @@ def _build_rpc_service(context_info, app, config):
     for _mod_name in (
         "bigqmt_signal_trader.full_tick_cache",
         "bigqmt_signal_trader.download_jobs",
+        "bigqmt_signal_trader.order_remarks",
+        "bigqmt_signal_trader.order_identity_journal",
         "bigqmt_signal_trader.exec_events",
     ):
         try:
             importlib.reload(importlib.import_module(_mod_name))
         except Exception as _reload_err:
             print("[bigqmt_rpc] reload %s failed: %s" % (_mod_name, _reload_err))
+    # The RPC import has a valid module even if early optional push loading
+    # failed. Callbacks reuse this reference without importing on the C++ stack.
+    _exec_events = _redis_rpc._exec_events
     BigQmtPositionProvider = _position_bigqmt.BigQmtPositionProvider
 
     qmt_api = dict(config.get("qmt_api") or {})
@@ -801,6 +830,12 @@ def _build_rpc_service(context_info, app, config):
     _store_redis = response_redis_client or redis_client or _exec_event_redis(config)
     handlers.download_job_redis_client = _store_redis
     handlers.order_identity_redis_client = _store_redis
+    handlers.order_remark_redis_client = _exec_events.bounded_identity_client(_store_redis)
+    if _store_redis is None:
+        # Pipe and other Redis-free transports need a durable source after a
+        # real strategy/process restart, when the in-memory journal is gone.
+        handlers.enable_order_identity_persistence(
+            directory=rpc_config.get("order_identity_dir"))
     # Settlement reads the callback-fed watch table first (issue #164).
     handlers.order_watch_table = _order_watch_table
     # Whether _pump_download_jobs will actually run queued jobs. The submit RPC
@@ -1936,7 +1971,21 @@ def _event_account_id(obj):
     return ""
 
 
-def _publish_exec_event(kind, obj, context_info=None):
+def _recover_callback_remark(kind, obj):
+    """Record native associations independently of push enablement/success."""
+    try:
+        event = (_exec_events.normalize_trade_event(obj, _account_id) if kind == "trade"
+                 else _exec_events.normalize_order_event(obj, _account_id))
+        handlers = getattr(_rpc_service, "handlers", None)
+        if handlers is not None:
+            return handlers._recover_order_remarks(event.get("account_id"), [event])[0]
+        return event
+    except Exception as exc:
+        print("[bigqmt_exec] order remark observation failed: %s" % type(exc).__name__)
+        return None
+
+
+def _publish_exec_event(kind, obj, context_info=None, normalized_event=None):
     """Push a normalized order/trade event to Redis for real-time client callbacks."""
     config = _build_config()
     event_config = dict(config.get("exec_events") or {})
@@ -1970,7 +2019,8 @@ def _publish_exec_event(kind, obj, context_info=None):
         return
     try:
         if kind == "trade":
-            event = exec_events.normalize_trade_event(obj, account_id)
+            event = (normalized_event if normalized_event is not None
+                     else exec_events.normalize_trade_event(obj, account_id))
             event = _enrich_event_identity(exec_events, config, account_id, event)
             if not event.get("instrument_name"):
                 event["instrument_name"] = _event_instrument_name(
@@ -1979,7 +2029,8 @@ def _publish_exec_event(kind, obj, context_info=None):
                 event["raw_fields"] = raw_fields
             _publish_one(exec_events, sink, account_id, event, kind, config)
         else:
-            event = exec_events.normalize_order_event(obj, account_id)
+            event = (normalized_event if normalized_event is not None
+                     else exec_events.normalize_order_event(obj, account_id))
             # Identity enrichment reads the remark->identity map that
             # remember_order_identity wrote. On a push channel the event goes
             # out un-enriched rather than not at all; order_sys_id and remark
@@ -2026,13 +2077,15 @@ def order_callback(ContextInfo, orderInfo):
     """Standard Big QMT order callback."""
     # Settlement feeds on this even when client push is off (issue #164).
     _note_order_watch(orderInfo)
-    _publish_exec_event("order", orderInfo, ContextInfo)
+    event = _recover_callback_remark("order", orderInfo)
+    _publish_exec_event("order", orderInfo, ContextInfo, normalized_event=event)
     return forward_order_event(BigQmtRuntimeAdapter.to_order_event(orderInfo))
 
 
 def deal_callback(ContextInfo, dealInfo):
     """Standard Big QMT deal callback."""
-    _publish_exec_event("trade", dealInfo, ContextInfo)
+    event = _recover_callback_remark("trade", dealInfo)
+    _publish_exec_event("trade", dealInfo, ContextInfo, normalized_event=event)
     return forward_trade_event(BigQmtRuntimeAdapter.to_trade_event(dealInfo))
 
 
