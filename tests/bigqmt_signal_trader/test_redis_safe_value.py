@@ -30,6 +30,9 @@ def test_large_encoded_response_bounds_runs_and_never_checks_operations(real_red
     token = real_redis.eval(LUA_ENCODE + LUA_RESEGMENT +
                             "return safe_resegment(safe_encode(ARGV[1], ARGV[2]), ARGV[2])",
                             0, raw, PREFIX).decode("ascii")
+    # Shorter reply chunks bound the Windows QMT filter's backtracking too;
+    # keep the original five-second stress budget below unchanged.
+    assert max(map(len, token[len(PREFIX):].split("0"))) <= 16
     assert len(re.findall(r"(?<=\D)0(?=\D)", token)) == token.count("0") > 0
     rows = [token.encode("ascii") if as_bytes else token] * 200
     vendor._assert_bounded_response(rows)

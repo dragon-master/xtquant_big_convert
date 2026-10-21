@@ -30,12 +30,14 @@ end
 """
 
 
-# QMT's stock regex backtracks over non-digit runs (#423). 32 letters per
-# reply chunk cost ~3% extra wire bytes. Start the first chunk with a zero too,
-# so JSON punctuation cannot join short replies into an unbounded run. Each
-# zero has non-digit neighbours and cannot form a six-digit stock code.
+# QMT's stock regex backtracks over non-digit runs (#423). 16 letters per
+# reply chunk cost ~6% extra wire bytes, but also keep multi-megabyte replies
+# below the response-filter time budget on the Windows deployment. Start the
+# first chunk with a zero too, so JSON punctuation cannot join short replies
+# into an unbounded run. Each zero has non-digit neighbours and cannot form a
+# six-digit stock code.
 # Storage stays all-letter for byte-for-byte compatibility with old readers.
-_REPLY_CHUNK_LETTERS = 32
+_REPLY_CHUNK_LETTERS = 16
 LUA_RESEGMENT = """
 local function safe_resegment(raw, prefix)
     local token = string.gsub(string.sub(raw, #prefix + 1), '0', '')

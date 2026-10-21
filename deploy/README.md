@@ -43,6 +43,8 @@ powershell -ExecutionPolicy Bypass -File .\deploy_qmt_bridge.ps1 `
 
 本部署方案只使用完整 QMT，因此生成的服务端配置显式设置 `native_xtdata_enabled=False`，跳过对 MiniQMT 行情服务的连接尝试。行情快照、合约资料等有 QMT 内置接口可用的查询继续使用这些接口；仅依赖原生 SDK 且没有内置替代的接口会明确报不可用。以后若同机运行已登录的 MiniQMT 并需要其接口，可按需启用该配置；重新运行本部署脚本仍会恢复为 `False`。
 
+本分支合并 0.3.71 后，将 Redis 身份记录及委托备注回复的编码分段缩短为每 16 个字母一段，减少 Windows QMT 检查超大回复时的耗时。只调整通信中的回复格式，不改变 Redis 已有记录、有效期或交易字段；升级时须同步整个服务端包，让 Lua 回复编码与 Python 解码配套更新。
+
 修改 `bigqmt_signal_trader_local_config.py` 后需要重启桥接策略。`reload_deployment` 只重新加载包内代码，不会重新读取入口已加载的私有配置。
 
 ### 升级已有部署：保留私有配置
