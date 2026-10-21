@@ -39,6 +39,11 @@ TTL = exec_events.ORDER_IDENTITY_TTL_SECONDS
 
 @pytest.fixture(scope="module")
 def redis_socket(tmp_path_factory):
+    # Windows Redis can run TCP tests, but cannot provide this suite's Unix
+    # socket. Check the transport requirement before using the POSIX-only
+    # /tmp directory; finding redis-server on PATH must not cause setup errors.
+    if os.name != "posix":
+        pytest.skip("isolated Redis Unix-socket tests require POSIX")
     binary = shutil.which("redis-server")
     if not binary:
         pytest.skip("redis-server required for atomic Lua integration")
@@ -78,6 +83,17 @@ def client(redis_socket):
     result.flushdb()
     yield result
     result.close()
+
+
+def test_unix_socket_platform_check_precedes_temporary_directory_creation(monkeypatch):
+    def unexpected_directory(**kwargs):
+        pytest.fail("a Unix-socket test tried creating files on Windows")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "name", "nt")
+        patch.setattr(tempfile, "TemporaryDirectory", unexpected_directory)
+        with pytest.raises(pytest.skip.Exception, match="require POSIX"):
+            next(redis_socket.__wrapped__(None))
 
 
 def row(remark="intent-1", **fields):
