@@ -610,6 +610,29 @@ def _config_bool(value, default=False):
     return str(value).strip().lower() in ("1", "true", "yes", "y", "on")
 
 
+def _native_xtdata_enabled(rpc_config):
+    """May the RPC-side market provider use the native xtdata SDK?
+
+    Mirrors ``adapter_factory.build_app``: native SDK calls dial the local
+    quote service (127.0.0.1:58610). On a pipe deployment -- the transport
+    whose whole purpose is "sandbox that kills outbound connects" -- that dial
+    is never acceptable, so native stays off unless the config asks for it
+    explicitly.
+
+    This has to be applied to the provider built for the RPC handlers too,
+    not just the one inside the app: ``_build_rpc_service`` constructs its own
+    provider, and without the gate it defaults to native-on. A pipe strategy
+    in that state answers ``get_instrument_detail`` by dialing 58610, which
+    the QMT terminal reports as ``非法IP:127.0.0.1:58610`` and blocks the
+    strategy thread behind a modal dialog until every later RPC times out.
+    """
+    if _load_bridge_module is not None:
+        factory = _load_bridge_module("bigqmt_signal_trader.adapter_factory")
+    else:
+        from bigqmt_signal_trader import adapter_factory as factory
+    return factory.resolve_native_xtdata_enabled(rpc_config)
+
+
 _REDIS_TRANSPORT_NAMES = ("redis", "", "default")
 
 

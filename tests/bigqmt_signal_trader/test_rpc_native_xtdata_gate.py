@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.join(ROOT, "src"))
 
 import bigqmt_signal_trader_strategy as strategy
 from bigqmt_signal_trader.adapters import market_bigqmt
-from bigqmt_signal_trader import download_jobs
+from bigqmt_signal_trader import adapter_factory, download_jobs
 
 
 class Context(object):
@@ -74,6 +74,41 @@ class RpcNativeXtdataGateTest(unittest.TestCase):
         with mock.patch.object(market_bigqmt, "_load_native_xtdata",
                                side_effect=AssertionError("native SDK must not load")):
             self.assertIsNone(provider._native())
+
+    def test_shared_resolver_preserves_transport_defaults_and_explicit_values(self):
+        cases = (
+            (None, True),
+            ({}, True),
+            ({"transport": "redis"}, True),
+            ({"transport": "zmq"}, True),
+            ({"transport": "pipe"}, False),
+            ({"transport": "PIPE"}, False),
+            ({"transport": "pipe", "native_xtdata_enabled": True}, True),
+            ({"transport": "redis", "native_xtdata_enabled": False}, False),
+        )
+        for rpc, expected in cases:
+            with self.subTest(rpc=rpc):
+                self.assertIs(adapter_factory.resolve_native_xtdata_enabled(rpc), expected)
+                self.assertIs(strategy._native_xtdata_enabled(rpc), expected)
+
+    def test_application_rpc_download_and_upstream_helper_share_one_resolver(self):
+        config = {"mode": "bigqmt", "account_id": "test-only",
+                  "rpc": {"transport": "redis", "native_xtdata_enabled": True},
+                  "download_jobs": {"enabled": True}}
+        with mock.patch.object(adapter_factory, "resolve_native_xtdata_enabled",
+                               return_value=False) as resolve:
+            app = adapter_factory.build_app(Context(), config)
+            self.assertFalse(app.market_data.native_xtdata_enabled)
+            service = self._service(native_enabled=True)
+            self.assertFalse(service.handlers.market_data.native_xtdata_enabled)
+            with mock.patch.object(strategy, "_load_bridge_module", None):
+                self.assertFalse(strategy._native_xtdata_enabled(config["rpc"]))
+            with mock.patch.object(strategy, "_rpc_service", None), \
+                    mock.patch.object(strategy, "_exec_event_redis", return_value=object()), \
+                    mock.patch.object(download_jobs, "pump_download_jobs") as pump:
+                strategy._pump_download_jobs(Context(), config)
+            self.assertFalse(pump.call_args[0][1].native_xtdata_enabled)
+            self.assertEqual(resolve.call_count, 4)
 
 
 if __name__ == "__main__":

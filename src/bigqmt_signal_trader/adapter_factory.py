@@ -60,6 +60,15 @@ def _config_bool(value, default=False):
     return str(value).strip().lower() in ("1", "true", "yes", "y", "on")
 
 
+def resolve_native_xtdata_enabled(rpc_config=None):
+    """One SDK gate for the application, RPC handlers and download fallback."""
+    rpc_config = dict(rpc_config or {})
+    native_enabled = rpc_config.get("native_xtdata_enabled")
+    if native_enabled is None:
+        native_enabled = str(rpc_config.get("transport") or "redis").lower() != "pipe"
+    return bool(native_enabled)
+
+
 def build_bigqmt_market_data_provider(context_info, config=None):
     """Build the application/RPC/download provider with the same SDK gate.
 
@@ -70,14 +79,10 @@ def build_bigqmt_market_data_provider(context_info, config=None):
     from .adapters.market_bigqmt import BigQmtMarketDataProvider
 
     config = config or {}
-    rpc_config = dict(config.get("rpc") or {})
-    native_enabled = rpc_config.get("native_xtdata_enabled")
-    if native_enabled is None:
-        native_enabled = str(rpc_config.get("transport") or "redis").lower() != "pipe"
     return BigQmtMarketDataProvider(
         context_info,
         qmt_api=config.get("qmt_api") or {},
-        native_xtdata_enabled=bool(native_enabled),
+        native_xtdata_enabled=resolve_native_xtdata_enabled(config.get("rpc")),
     )
 
 
