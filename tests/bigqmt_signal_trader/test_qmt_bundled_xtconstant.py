@@ -41,6 +41,12 @@ import unittest
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(ROOT, "src"))
 
+from qmt_source_inspection import (
+    iter_original_python_sources,
+    parse_python_source,
+    read_python_source,
+)
+
 SRC = os.path.join(ROOT, "src")
 NAMES_FILE = os.path.join(ROOT, "tests", "data", "qmt_bundled_xtconstant_names.txt")
 
@@ -66,19 +72,14 @@ def _bundled_names():
 
 
 def _server_side_modules():
-    for root, _dirs, files in os.walk(SRC):
+    for path in iter_original_python_sources(SRC):
         # The shim itself. Compare path COMPONENTS: the repo directory is
         # called xtquant_big_convert, so a substring test on the path excludes
         # every file in the project (which is how this guard first "passed").
-        if "xtquant" in os.path.relpath(root, SRC).split(os.sep):
+        relative = os.path.relpath(path, SRC)
+        if "xtquant" in relative.split(os.sep) or relative in CLIENT_SIDE:
             continue
-        for name in sorted(files):
-            if not name.endswith(".py"):
-                continue
-            path = os.path.join(root, name)
-            if os.path.relpath(path, SRC) in CLIENT_SIDE:
-                continue
-            yield path
+        yield path
 
 
 class TheSnapshotIsUsableTest(unittest.TestCase):
@@ -125,8 +126,7 @@ class ServerSideUsageTest(unittest.TestCase):
         offenders = {}
 
         for path in _server_side_modules():
-            with io.open(path, encoding="utf-8") as handle:
-                text = handle.read()
+            text = read_python_source(path)
             used = set(ATTRIBUTE_USE.findall(text))
             missing = sorted(name for name in used if name not in available)
             if missing:
@@ -144,8 +144,7 @@ class ServerSideUsageTest(unittest.TestCase):
         offenders = {}
 
         for path in _server_side_modules():
-            with io.open(path, encoding="utf-8") as handle:
-                tree = ast.parse(handle.read())
+            tree = parse_python_source(path)
             for node in ast.walk(tree):
                 if not isinstance(node, ast.ImportFrom):
                     continue

@@ -6,11 +6,17 @@ import io
 import math
 import os
 import sys
+import tempfile
 import unittest
 
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(ROOT, "src"))
+
+from qmt_source_inspection import (
+    iter_original_python_sources,
+    parse_python_source as _read_python_ast,
+)
 
 from bigqmt_signal_trader.option_analytics import (
     black_scholes_price,
@@ -335,6 +341,23 @@ class ContractAnalyticsTest(unittest.TestCase):
 
 
 class ClientOnlyImportBoundaryTest(unittest.TestCase):
+    def test_source_reader_honors_python_encoding_without_hiding_imports(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "server.py")
+            for encoding in ("utf-8", "utf-8-sig", "gbk"):
+                with self.subTest(encoding=encoding):
+                    declared = "utf-8" if encoding.startswith("utf-8") else encoding
+                    source = (
+                        "# coding: %s\n# 中文源码\n"
+                        "from bigqmt_signal_trader.option_analytics import option_greeks\n"
+                    ) % declared
+                    with io.open(path, "w", encoding=encoding) as handle:
+                        handle.write(source)
+                    tree = _read_python_ast(path)
+                    modules = [node.module for node in ast.walk(tree)
+                               if isinstance(node, ast.ImportFrom)]
+                    self.assertIn("bigqmt_signal_trader.option_analytics", modules)
+
     def test_qmt_server_modules_do_not_import_option_analytics(self):
         """Keep local models out of the QMT strategy/runtime import graph."""
         src = os.path.join(ROOT, "src")
@@ -345,24 +368,19 @@ class ClientOnlyImportBoundaryTest(unittest.TestCase):
             os.path.join("bigqmt_signal_trader", "option_analytics_client.py"),
         }
         offenders = []
-        for directory, _subdirs, filenames in os.walk(src):
-            for filename in filenames:
-                if not filename.endswith(".py"):
-                    continue
-                path = os.path.join(directory, filename)
-                relative = os.path.relpath(path, src)
-                if relative in client_only or "xtquant" in relative.split(os.sep):
-                    continue
-                with io.open(path, encoding="utf-8") as handle:
-                    tree = ast.parse(handle.read())
-                for node in ast.walk(tree):
-                    module = ""
-                    if isinstance(node, ast.ImportFrom):
-                        module = node.module or ""
-                    elif isinstance(node, ast.Import):
-                        module = ",".join(alias.name for alias in node.names)
-                    if "option_analytics" in module:
-                        offenders.append(relative)
+        for path in iter_original_python_sources(src):
+            relative = os.path.relpath(path, src)
+            if relative in client_only or "xtquant" in relative.split(os.sep):
+                continue
+            tree = _read_python_ast(path)
+            for node in ast.walk(tree):
+                module = ""
+                if isinstance(node, ast.ImportFrom):
+                    module = node.module or ""
+                elif isinstance(node, ast.Import):
+                    module = ",".join(alias.name for alias in node.names)
+                if "option_analytics" in module:
+                    offenders.append(relative)
 
         self.assertEqual(offenders, [])
 
