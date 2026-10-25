@@ -1748,6 +1748,15 @@ class BigQmtRpcClient:
             future.add_done_callback(lambda fut: dispatcher.submit(_deliver, fut))
         return future
 
+    def _quote_metadata_uses_redis(self):
+        """Optional subscription records must not create a Redis dependency."""
+        if self.transport_name == "pipe":
+            return self._redis_explicit or self.redis_client is not None
+        if self.transport_name == "zmq":
+            return bool(self.zmq_config.get("redis_discovery_enabled", False))
+        # Preserve the existing Redis, MySQL and SHM metadata paths.
+        return True
+
     def publish_event(self, event_type, payload, stream_template="bigqmt:quote_events:{account_id}"):
         account_id = str(self.account_id or "")
         event = {
@@ -1756,8 +1765,7 @@ class BigQmtRpcClient:
             "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "payload": payload or {},
         }
-        # 显式地址且未启用 Redis discovery 的 ZMQ 是纯 ZMQ 模式，不应隐式连接 Redis。
-        if self.transport_name == "zmq" and not bool(self.zmq_config.get("redis_discovery_enabled", False)):
+        if not self._quote_metadata_uses_redis():
             return event
         raw = json.dumps(event, ensure_ascii=False, default=str)
         stream_key = stream_template.format(account_id=account_id)
@@ -1777,8 +1785,7 @@ class BigQmtRpcClient:
         return event
 
     def save_quote_subscription(self, seq, payload, active=True):
-        # MySQL、SHM 和混合 ZMQ 继续保留既有 Redis subscription metadata 行为。
-        if self.transport_name == "zmq" and not bool(self.zmq_config.get("redis_discovery_enabled", False)):
+        if not self._quote_metadata_uses_redis():
             return
         account_id = str(self.account_id or "")
         key = "bigqmt:quote_subscriptions:%s" % account_id
@@ -3336,9 +3343,11 @@ class BigQmtXtData:
             return DEFAULT_BAR_POLL_INTERVAL_SECONDS
 
     def _record_subscription(self, seq, payload, active=True):
-        """Bookkeeping only -- nothing on the server consumes it, and it needs a
-        Redis client, which a zmq deployment does not have. Never let it break
-        an otherwise working subscription."""
+        """Optional Redis records; the RPC session owns subscription lifetime.
+
+        The client's metadata gate skips Redis-free transports. Failure of an
+        explicitly configured store must not break an active subscription.
+        """
         try:
             self.client.save_quote_subscription(seq, dict(payload, seq=seq), active=active)
             self.client.publish_event(
@@ -6377,12 +6386,11 @@ class BigQmtXtTrader:
     def _has_push_channel(self):
         """Whether exec events can reach this client at all (#345).
 
-        redis carries them on pub/sub, zmq on the PUB socket; pipe / mysql /
-        shm have no push path, so nothing the server emits after the reply
-        ever arrives.
+        Redis carries them on pub/sub. Other native push transports must use
+        the same capability check as the execution-event receiver.
         """
         transport_name = str(getattr(self.client, "transport_name", "redis") or "redis").lower()
-        return transport_name in ("redis", "", "default", "zmq")
+        return transport_name in ("redis", "", "default") or self._exec_transport_uses_push_channel()
 
     def _submit_async_single(self, seq, args, kwargs):
         """Submit one job and enqueue its outcome. Runs on the order worker."""
@@ -6394,7 +6402,7 @@ class BigQmtXtTrader:
             # 服务端结算（那是 #69 要的吞吐）。委托号从推送事件学——屏障暂存的
             # 委托事件里会带上（触发 response 前至多等 2s，学不到就回落 remark）。
             #
-            # 没有推送通道的传输（pipe / mysql）学不到任何事件，服务端为拒单
+            # 没有推送通道的传输（mysql / shm）学不到任何事件，服务端为拒单
             # 推的 order_error 也到不了（#345）。那里让 worker 等服务端结算：
             # 调用方本来就不阻塞，而 server_error 会走下面的 except 变成
             # on_order_error，否则一张资金不足被终端拦下的单永远没有回音。

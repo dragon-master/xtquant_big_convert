@@ -9,7 +9,7 @@ order as its credit order_type, not 23/24.
 * async orders (order_stock_async, wait_settlement=False) keep a SHADOW
   settlement after the reply went out; when the deadline passes with no row,
   the server pushes an order_error the caller's on_order_error receives;
-* a client on a transport with no push path (pipe / mysql) cannot receive
+* a client on a transport with no push path (mysql / shm) cannot receive
   that push, so its async worker waits for the server's settlement instead
   and turns the server_error into on_order_error itself;
 * the "not found in system" text names the pre-record refusal.
@@ -284,12 +284,12 @@ class PushlessClientTest(unittest.TestCase):
 
     def test_which_transports_have_a_push_path(self):
         for name, expected in (("redis", True), ("", True), ("zmq", True),
-                               ("pipe", False), ("mysql", False), ("shm", False)):
+                               ("pipe", True), ("mysql", False), ("shm", False)):
             self.assertEqual(expected, self._trader(name)._has_push_channel(), name)
 
     def test_an_async_order_waits_for_the_settlement_when_nothing_can_push(self):
         seen = {}
-        trader = self._trader("pipe")
+        trader = self._trader("mysql")
         trader.order_stock_result = lambda *a, **kw: seen.setdefault("wait", kw.get("wait_settlement")) or {"order_sys_id": "1"}
         trader._enqueue_async_outcome = lambda unit: None
         trader._submit_async_single(1, ("acct", "600000.SH", 23, 100, 11, 10.0, "s", "r"), {})
@@ -306,7 +306,7 @@ class PushlessClientTest(unittest.TestCase):
     def test_a_server_error_on_the_waiting_path_becomes_an_error_outcome(self):
         from bigqmt_signal_trader.xtquant_compat import RpcServerRepliedError
         units = []
-        trader = self._trader("pipe")
+        trader = self._trader("mysql")
 
         def boom(*a, **kw):
             raise RpcServerRepliedError("Big QMT order_stock server_error: passorder submitted but order not found in system")
