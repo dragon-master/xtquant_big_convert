@@ -428,11 +428,14 @@ def build_quote_subscription_service(
         # pipe. The exec-event sink falls through to _push_channel_sink, so
         # order/trade callbacks ride the same channel for free.
         from .transports.pipe_push_channel import (
-            PipeQuotePushChannel, pipe_events_path,
+            MultiAccountPipePushChannel, PipeQuotePushChannel, pipe_events_path,
         )
 
         events_address = pipe_events_path(pipe_name, account_id)
-        channel = PipeQuotePushChannel(bind_address=events_address)
+        if len(served) > 1:
+            channel = MultiAccountPipePushChannel(served, pipe_name=pipe_name)
+        else:
+            channel = PipeQuotePushChannel(bind_address=events_address)
         push_endpoint = events_address
     elif redis_client is None:
         # pipe（或 redis 被关掉的部署）没有推送线——静默空通道，而不是

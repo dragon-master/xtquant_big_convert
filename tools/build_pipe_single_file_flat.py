@@ -9,8 +9,8 @@
 与 no-redis 版的差异：
 - 不替换 zmq_transport（pipe_transport 本来就在包里，ctypes/kernel32 零依赖）；
 - 不内嵌 bigqmt_no_redis/；
-- 强制 transport=pipe + redis_enabled=False + quote_push 关（pipe 没有推送线，
-  执行回调由客户端轮询合成，#372）+ download_jobs / full_tick_cache 关
+- 强制 transport=pipe + redis_enabled=False；行情和执行回报走独立事件管道。
+  download_jobs / full_tick_cache 关
   （这两个需要 redis）。
 
 用法：python tools/build_pipe_single_file_flat.py，产物在
@@ -73,10 +73,9 @@ loader below resolves relative imports against the in-memory modules, so you
 can copy this one file to a QMT python directory and run it as a strategy
 without shipping the package alongside.
 
-Callbacks: the pipe has no push channel. on_stock_order / on_stock_trade /
-on_order_error are synthesized client-side by polling queries (#372, default
-1s, BIGQMT_EXEC_POLL_SECONDS). Whole-quote push (subscribe_whole_quote) is
-disabled in this build -- poll get_full_tick instead.
+Callbacks and whole-quote subscriptions use a separate events pipe (#408).
+Each configured account has its own RPC and events pipes. Secondary-account
+execution events are read on the QMT strategy thread (default interval 1s).
 
 Edit BIGQMT_ACCOUNT_ID below before running.
 """)
@@ -118,13 +117,15 @@ PIPE_TEMPLATE = PIPE_TEMPLATE.replace(
     # Nothing here may dial out: redis 块不下发（懒 client 首个命令就 connect，
     # EDR 抓到就杀进程，2026-09-24 实盘）。
     BIGQMT_REDIS_CONFIG["redis_enabled"] = False
-    # pipe 没有推送线：全推推送关掉（客户端轮询 get_full_tick / 执行回调由
-    # 客户端轮询合成 #372）；下载队列和快照缓存需要 redis，一并关。
-    BIGQMT_REDIS_CONFIG["quote_push"] = {"enabled": False}
+    # #408: 行情与执行回报有独立事件管道，不需要 Redis/socket。
+    # 显式关闭仍然有效；下载队列和快照缓存需要 Redis，保持关闭。
+    BIGQMT_REDIS_CONFIG.setdefault("quote_push", {"enabled": True})
     BIGQMT_REDIS_CONFIG.setdefault("download_jobs_enabled", False)
     BIGQMT_REDIS_CONFIG.setdefault("full_tick_cache_enabled", False)
     print("[bigqmt_shell] pipe mode: transport=pipe background_threads=%s "
-          "redis_enabled=False quote_push=False" % BIGQMT_REDIS_CONFIG["rpc_background_threads"])''')
+          "redis_enabled=False quote_push=%s" % (
+              BIGQMT_REDIS_CONFIG["rpc_background_threads"],
+              BIGQMT_REDIS_CONFIG["quote_push"].get("enabled", True)))''')
 
 assert "transport=pipe" in PIPE_TEMPLATE and '"transport": "pipe",' in PIPE_TEMPLATE, \
     "template replacements did not land"

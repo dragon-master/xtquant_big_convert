@@ -804,7 +804,7 @@ class BigQmtRpcHandlers:
     def _handle_ping(self, params):
         return {
             "pong": True,
-            "account_id": self.account_id,
+            "account_id": str(params.get("account_id") or self.account_id),
             "allow_order_methods": bool(self.allow_order_methods),
             "rpc_revision": RPC_REVISION,
             "version": _deployed_version(),

@@ -94,7 +94,7 @@ class SecondaryOnZmqTest(unittest.TestCase):
         self.assertIsNotNone(service)
 
     def test_a_transport_without_per_account_endpoints_is_refused_not_broken(self):
-        for name in ("pipe", "mysql", "shm"):
+        for name in ("mysql", "shm"):
             self.assertIsNone(multi_account._build_secondary(
                 _primary(), "222", {"rpc": {"transport": name}}), name)
 

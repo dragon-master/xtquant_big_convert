@@ -54,6 +54,41 @@ def pipe_events_path(name=DEFAULT_PIPE_NAME, account_id=""):
     return pipe_path(str(name or DEFAULT_PIPE_NAME) + "_events", account_id)
 
 
+class MultiAccountPipePushChannel(object):
+    """Publish quotes to all accounts and execution events only to their owner."""
+
+    def __init__(self, account_ids, pipe_name=None):
+        self.channels = {}
+        for account_id in account_ids:
+            account_id = str(account_id)
+            if account_id not in self.channels:
+                self.channels[account_id] = PipeQuotePushChannel(
+                    bind_address=pipe_events_path(pipe_name, account_id))
+        self.bind_address = next(iter(self.channels.values())).bind_address
+
+    def start_publisher(self):
+        try:
+            for channel in self.channels.values():
+                channel.start_publisher()
+        except Exception:
+            self.stop()
+            raise
+
+    def publish(self, topic, data):
+        if str(topic).startswith("exec:"):
+            account_id = str(data.get("account_id") or "") if isinstance(data, dict) else ""
+            channel = self.channels.get(account_id)
+            if channel is not None:
+                channel.publish(topic, data)
+            return
+        for channel in self.channels.values():
+            channel.publish(topic, data)
+
+    def stop(self):
+        for channel in self.channels.values():
+            channel.stop()
+
+
 class PipeQuotePushChannel(object):
     """Named-pipe push channel: bind_address publishes, connect_address subscribes."""
 

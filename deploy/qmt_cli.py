@@ -1,5 +1,5 @@
 # coding: utf-8
-"""Big QMT redis-bridge CLI client (Jianghai Securities deployment).
+"""Big QMT RPC bridge CLI client.
 
 External-python entry point for querying assets/positions/orders/trades and
 market data through the xtquant_big_convert RPC bridge, plus order submit and
@@ -19,8 +19,8 @@ cancel. Usage examples:
     python qmt_cli.py watch
 
 The account id is read from bigqmt_signal_trader_client_config.BIGQMT_ACCOUNT_ID,
-or from --account / BIGQMT_ACCOUNT_ID env var. `discover` scans Redis for the
-account id the QMT-side strategy registered.
+or from --account / BIGQMT_ACCOUNT_ID env var. `discover` scans Redis in Redis
+mode; other transports list accounts from the local config without connecting.
 """
 import argparse
 import json
@@ -42,7 +42,6 @@ from bigqmt_signal_trader.xtquant_compat import (  # noqa: E402
 )
 from xtquant import xtconstant  # noqa: E402
 from xtquant.xttype import StockAccount  # noqa: E402
-import redis  # noqa: E402
 
 
 def account_id(args):
@@ -73,7 +72,11 @@ def redis_kwargs():
 
 def raw_redis():
     kw = redis_kwargs()
-    kw.pop("transport", None)
+    transport = str(kw.pop("transport", "redis") or "redis").lower()
+    if transport not in ("redis", "", "default"):
+        sys.exit("Redis inspection is unavailable with transport=%s" % transport)
+    import redis
+
     kw.pop("zmq", None)
     username = kw.get("username") or None
     kw["username"] = username
@@ -98,7 +101,11 @@ def make_data(acc_id):
 
 
 def as_stock_account(acc_id):
-    account_type = str(getattr(cfg, "BIGQMT_ACCOUNT_TYPE", "STOCK") or "STOCK")
+    from bigqmt_signal_trader.account_type_map import primary_account_type
+
+    mapping = dict(getattr(cfg, "BIGQMT_ACCOUNT_TYPE_MAP", {}) or {})
+    account_type = primary_account_type(
+        mapping.get(acc_id, getattr(cfg, "BIGQMT_ACCOUNT_TYPE", "STOCK")))
     return StockAccount(acc_id, account_type)
 
 
@@ -113,6 +120,13 @@ def fmt_row(obj, fields):
 
 
 def cmd_discover(args):
+    transport = str(redis_kwargs().get("transport") or "redis").lower()
+    if transport not in ("redis", "", "default"):
+        mapping = dict(getattr(cfg, "BIGQMT_ACCOUNT_TYPE_MAP", {}) or {})
+        accounts = list(mapping) or [account_id(args)]
+        print("configured accounts (transport=%s; connection not checked): %s"
+              % (transport, sorted(accounts)))
+        return
     r = raw_redis()
     keys = [k.decode() if isinstance(k, bytes) else k for k in r.keys("bigqmt:*")]
     if not keys:
@@ -300,14 +314,16 @@ def cmd_watch(args):
             time.sleep(1)
     except KeyboardInterrupt:
         print("\nstopped.")
+    finally:
+        trader.stop()
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Big QMT redis-bridge CLI")
+    parser = argparse.ArgumentParser(description="Big QMT RPC bridge CLI")
     parser.add_argument("--account", default="", help="override account id")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("discover", help="scan redis for registered accounts")
+    sub.add_parser("discover", help="list configured accounts; Redis mode also scans server keys")
     sub.add_parser("ping", help="rpc ping")
     sub.add_parser("asset", help="query account asset")
     sub.add_parser("positions", help="query positions")

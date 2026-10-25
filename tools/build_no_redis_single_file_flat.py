@@ -297,6 +297,8 @@ BIGQMT_ACCOUNT_ID = "YOUR_ACCOUNT_ID"
 
 BIGQMT_ACCOUNT_TYPE = "STOCK"
 
+BIGQMT_ACCOUNT_TYPE_MAP = {}
+
 BIGQMT_REDIS_CONFIG = {
     "host": "127.0.0.1",
     "port": 6379,
@@ -343,6 +345,7 @@ BIGQMT_REDIS_CONFIG = {
 _SHELL_CONFIG = {
     "BIGQMT_ACCOUNT_ID": BIGQMT_ACCOUNT_ID,
     "BIGQMT_ACCOUNT_TYPE": BIGQMT_ACCOUNT_TYPE,
+    "BIGQMT_ACCOUNT_TYPE_MAP": dict(globals().get("BIGQMT_ACCOUNT_TYPE_MAP") or {}),
     "BIGQMT_REDIS_CONFIG": BIGQMT_REDIS_CONFIG,
 }
 
@@ -353,9 +356,10 @@ def _mod_local_config():
     # via global. Do NOT rely on __export_module__/closure cells/module lookup:
     # QMT's per-process reload can leave those paths stale, silently yielding an
     # empty account and disabling the RPC service.
-    global BIGQMT_ACCOUNT_ID, BIGQMT_ACCOUNT_TYPE, BIGQMT_REDIS_CONFIG
+    global BIGQMT_ACCOUNT_ID, BIGQMT_ACCOUNT_TYPE, BIGQMT_ACCOUNT_TYPE_MAP, BIGQMT_REDIS_CONFIG
     BIGQMT_ACCOUNT_ID = _SHELL_CONFIG.get("BIGQMT_ACCOUNT_ID", "")
     BIGQMT_ACCOUNT_TYPE = _SHELL_CONFIG.get("BIGQMT_ACCOUNT_TYPE", "STOCK")
+    BIGQMT_ACCOUNT_TYPE_MAP = _SHELL_CONFIG.get("BIGQMT_ACCOUNT_TYPE_MAP", {})
     BIGQMT_REDIS_CONFIG = _SHELL_CONFIG.get("BIGQMT_REDIS_CONFIG", {})
 
 _MODULE_FUNCS["bigqmt_signal_trader_local_config.py"] = _mod_local_config

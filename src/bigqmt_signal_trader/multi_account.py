@@ -22,9 +22,10 @@ Architecture
 
 One ``BigQmtRpcHandlers`` instance is shared across all RPC services.  The
 primary service runs on the adjust thread (``background_threads=False``);
-secondary services run on background threads (``background_threads=True``),
+Redis/ZMQ secondary services run on background threads (``background_threads=True``),
 with trade-context requests (submit, cancel, query) deferred to the primary's
-drain loop via ``pending`` queues.
+drain loop via ``pending`` queues. Named-pipe secondary services drain directly
+on that same strategy thread, each on its own account-specific pipe.
 
 Per-request account_type resolution (PR #135) means the gateway's
 ``_resolve_account_type(account_id)`` returns the correct type for each
@@ -287,36 +288,35 @@ def _secondary_zmq_config(rpc_config, account_id):
 
 
 def _build_secondary_non_redis(primary, account_id, config, transport_name):
-    """A secondary on the primary's transport kind, for zmq (#334).
+    """Build a separate ZMQ endpoint or named pipe for the secondary account.
 
-    Only zmq derives a per-account endpoint the client already knows how to
-    find; pipe / mysql / shm have no per-account addressing, so a secondary
-    on them is refused with a log line rather than built on a dead redis
-    client (the pre-#334 failure: ``'NoneType' object has no attribute
-    'pubsub'`` from the secondary's listener threads).
+    Both transports derive their address from account_id on the server and
+    client. MySQL/SHM cannot create an independent account endpoint here.
     """
     from .redis_rpc import RedisPubSubRpcService
 
     rpc_config = dict((config.get("rpc") or {}))
-    if transport_name != "zmq":
+    if transport_name not in ("zmq", "pipe"):
         logger.warning("multi_account: secondary %s*** not built -- transport %r has no "
-                       "per-account endpoint (redis or zmq only)", account_id[:3], transport_name)
+                       "per-account endpoint (redis, zmq or pipe only)", account_id[:3], transport_name)
         return None
     try:
         from .transports.factory import build_transport
 
         factory_config = dict(rpc_config)
         factory_config["account_id"] = account_id
-        factory_config["zmq"] = _secondary_zmq_config(rpc_config, account_id)
+        if transport_name == "zmq":
+            factory_config["zmq"] = _secondary_zmq_config(rpc_config, account_id)
         transport = build_transport(
             transport_name, factory_config, account_id=account_id,
             print_prefix="[bigqmt_rpc_2nd]")
     except Exception as e:
-        logger.error("multi_account: secondary %s*** zmq transport build failed: %s",
-                     account_id[:3], e)
+        logger.error("multi_account: secondary %s*** %s transport build failed: %s",
+                     account_id[:3], transport_name, e)
         return None
-    logger.info("multi_account: secondary %s*** on zmq bound=%s",
-                account_id[:3], getattr(transport, "bind_address", "?"))
+    logger.info("multi_account: secondary %s*** on %s endpoint=%s",
+                account_id[:3], transport_name,
+                getattr(transport, "path", getattr(transport, "bind_address", "?")))
     return RedisPubSubRpcService(
         redis_client=None,
         response_redis_client=None,
@@ -325,7 +325,7 @@ def _build_secondary_non_redis(primary, account_id, config, transport_name):
         max_queue_size=int(rpc_config.get("max_queue_size", 200)),
         process_in_listener=True,
         listener_methods=rpc_config.get("listener_methods") or ("*",),
-        background_threads=True,
+        background_threads=transport_name != "pipe",
         transport=transport,
     )
 
@@ -336,7 +336,8 @@ def _build_secondary(primary, account_id, config):
     The secondary gets its own Redis connection (so ``stop()`` on the secondary
     doesn't kill the primary's listener) and a ``SecondaryHandlersProxy`` that
     injects the secondary's account_id into every request. On a zmq
-    deployment it gets its own zmq endpoint instead (#334).
+    deployment it gets its own zmq endpoint instead (#334); pipe gets its
+    own account-specific named pipe, drained by the strategy thread.
     """
     rpc_config = dict((config.get("rpc") or {}))
     transport_name = str(rpc_config.get("transport") or "redis").lower()
