@@ -36,3 +36,26 @@ def test_pipe_build_keeps_multi_account_config_and_push(tmp_path):
     assert config["BIGQMT_ACCOUNT_ID"] == "stock"
     assert 'setdefault("quote_push", {"enabled": True})' in source
     assert 'BIGQMT_REDIS_CONFIG["redis_enabled"] = False' in source
+
+    # Execute only the generated entry's API-binding block with synthetic QMT
+    # globals. Never execute the strategy or connect to a running terminal.
+    from bigqmt_signal_trader_strategy import capture_qmt_injected_funcs
+
+    binding = next(node for node in tree.body if isinstance(node, ast.Try) and any(
+        isinstance(statement, ast.Assign) and any(
+            isinstance(name, ast.Name) and name.id == "qmt_extra"
+            for name in statement.targets)
+        for statement in node.body))
+    names = ("passorder", "cancel", "get_trade_detail_data", "download_history_data",
+             "download_history_data2", "down_history_data", "query_credit_account",
+             "call_formula", "subscribe_formula", "unsubscribe_formula",
+             "get_formula_result", "gen_factor_index")
+    injected = {name: (lambda *args, _name=name, **kwargs: _name) for name in names}
+    captured = []
+    namespace = dict(injected, _strategy=types.SimpleNamespace(
+        capture_qmt_injected_funcs=capture_qmt_injected_funcs),
+        _runtime=types.SimpleNamespace(bind_runtime_api=lambda **kwargs: captured.append(kwargs)))
+    exec(compile(ast.Module(body=[binding], type_ignores=[]), "<entry-binding>", "exec"), namespace)
+    assert len(captured) == 1
+    assert set(captured[0]["extra_funcs"]) == set(names)
+    assert all(captured[0]["extra_funcs"][name] is injected[name] for name in names)
